@@ -301,6 +301,15 @@ const CATALOG = {
     zh: "要联网检索并写作，通常一到几分钟。生成一次全局复用，别的项目用到同一个技术栈时是零成本的",
     en: "This searches the web and writes; usually a few minutes. Generated once and reused globally, so other projects using it pay nothing",
   },
+  job_running: { zh: "生成中…", en: "Generating…" },
+  job_running_detail: (elapsed: string) => ({
+    zh: `已跑 ${elapsed}。可以关掉这个面板，跑完了回来看`,
+    en: `Running for ${elapsed}. You can close this panel and come back`,
+  }),
+  job_failed: { zh: "生成失败", en: "Generation failed" },
+  job_open_session: { zh: "看看 agent 做了什么", en: "See what the agent did" },
+  job_done: { zh: "生成完成", en: "Generation complete" },
+  classify_running: { zh: "归类中…", en: "Classifying…" },
   wiki_sourced_ratio: (percent: number) => ({
     zh: `${percent}% 段落可溯源`,
     en: `${percent}% of sections are sourced`,

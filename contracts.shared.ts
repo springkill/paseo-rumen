@@ -222,6 +222,19 @@ export const AgentImpactSchema = z.object({
   reviews: z.array(ReviewItemSchema),
 });
 
+export const JobSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["wiki", "classify"]),
+  projectId: z.string(),
+  techId: z.string().nullable(),
+  status: z.enum(["running", "done", "failed"]),
+  startedAt: z.number().int(),
+  finishedAt: z.number().int().nullable(),
+  error: z.string().nullable(),
+  /** Rumen 起的那个会话。失败时用户要能点进去看它到底答了什么。 */
+  agentId: z.string().nullable(),
+});
+
 export const SettingsSchema = z.object({
   locale: z.enum(["auto", ...LOCALES]),
   /** `auto` 解析出来的实际语言，设置页要显示。 */
@@ -275,7 +288,7 @@ export const scanRpc = defineRpc({
 export const classifyRpc = defineRpc({
   name: "rumen.classify",
   input: WorkspaceInput,
-  output: z.object({ classified: z.number().int().nonnegative(), merged: z.number().int().nonnegative() }),
+  output: z.object({ job: JobSchema.nullable() }),
 });
 
 export const privacyRpc = defineRpc({
@@ -300,10 +313,22 @@ export const wikiRpc = defineRpc({
   output: WikiSchema.nullable(),
 });
 
+/**
+ * 起一个 wiki 生成任务。**立刻返回**，不等生成完。
+ *
+ * 生成要几分钟，长在请求-响应上会把界面转死，传输层也会先超时。
+ * 拿到 job 之后用 {@link jobsRpc} 轮询。
+ */
 export const generateWikiRpc = defineRpc({
   name: "rumen.generate-wiki",
   input: TechInput.extend({ lang: LocaleSchema, force: z.boolean().default(false) }),
-  output: WikiSchema,
+  output: z.object({ job: JobSchema.nullable(), wiki: WikiSchema.nullable() }),
+});
+
+export const jobsRpc = defineRpc({
+  name: "rumen.jobs",
+  input: WorkspaceInput,
+  output: z.object({ jobs: z.array(JobSchema) }),
 });
 
 export const quizNextRpc = defineRpc({
@@ -436,6 +461,7 @@ export type Wiki = z.output<typeof WikiSchema>;
 export type Quiz = z.output<typeof QuizSchema>;
 export type QuizResult = z.output<typeof QuizResultSchema>;
 export type Settings = z.output<typeof SettingsSchema>;
+export type Job = z.output<typeof JobSchema>;
 export type TimelineImpact = z.output<typeof TimelineImpactSchema>;
 export type PendingPackageView = z.output<typeof PendingPackageSchema>;
 

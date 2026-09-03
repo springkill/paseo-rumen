@@ -42,7 +42,18 @@ export class PrivacyLeakError extends Error {
  *
  * `roots` 传项目根路径，用来生成更精准的匹配（相对路径是允许的，绝对路径不是）。
  */
-export function assertNoProjectLeak(prompt: string, privacy: Privacy, roots: readonly string[] = []): void {
+export function assertNoProjectLeak(
+  prompt: string,
+  privacy: Privacy,
+  roots: readonly string[] = [],
+  /**
+   * 明确允许出现的路径 —— Rumen 自己的落盘位置。
+   *
+   * 这条口子必须是**显式传入的白名单**，不能放宽正则：放宽了就等于给
+   * "某个 /home/... 路径"开了后门，而项目路径正是长这样。
+   */
+  allow: readonly string[] = [],
+): void {
   if (privacy === "public") return;
 
   for (const root of roots) {
@@ -50,6 +61,7 @@ export function assertNoProjectLeak(prompt: string, privacy: Privacy, roots: rea
       throw new PrivacyLeakError("absolute_path", root);
     }
   }
+  const allowed = (path: string) => allow.some((item) => item && path.startsWith(item));
   // POSIX 绝对路径：至少两段，且不是常见的公共路径（技术文档里会提到 /etc/nginx 之类）
   const PUBLIC_PREFIXES = ["/etc/", "/usr/", "/var/log/", "/proc/", "/dev/", "/tmp/"];
   const absolute = prompt.match(/(?:^|[\s"'`(])(\/(?:[A-Za-z0-9._-]+\/){1,}[A-Za-z0-9._-]+)/g);
@@ -57,6 +69,7 @@ export function assertNoProjectLeak(prompt: string, privacy: Privacy, roots: rea
     for (const raw of absolute) {
       const path = raw.trim().replace(/^["'`(]/, "");
       if (PUBLIC_PREFIXES.some((prefix) => path.startsWith(prefix))) continue;
+      if (allowed(path)) continue;
       throw new PrivacyLeakError("absolute_path", path);
     }
   }

@@ -32,6 +32,7 @@ import { runStructured } from "./agentrun.server";
 import type { Privacy } from "./domain.shared";
 import { stableHash } from "./domain.shared";
 import type { Locale } from "./i18n.shared";
+import { runsDirectory } from "./agentrun.server";
 import { allowsProjectCode, assertNoProjectLeak } from "./privacy.shared";
 import type { StoredAnchor, StoredNode, StoredWiki, StoredWikiSection } from "./store.server";
 
@@ -191,15 +192,19 @@ export async function generateWiki(input: {
   majorVersion: string;
   lang: Locale;
   now?: number;
+  runId: string;
+  onAgent?: (agentId: string) => void;
 }): Promise<GeneratedWiki> {
   const now = input.now ?? Date.now();
   const prompt = wikiPrompt(input.techName, input.majorVersion, input.lang);
   // Shared 层不含项目内容，但闸门照走一遍 —— 防的是以后有人往 prompt 里塞东西
   assertNoProjectLeak(prompt, input.privacy);
 
-  const raw = await runStructured<RawWiki>({
+  const { value: raw } = await runStructured<RawWiki>({
     paseo: input.paseo,
     task: `wiki:${input.techName}`,
+    runId: input.runId,
+    onAgent: input.onAgent,
     prompt,
     schema: WIKI_SCHEMA,
     cwd: input.cwd,
@@ -373,6 +378,8 @@ export async function generateQuestion(input: {
   nodeSummary: string;
   anchors: readonly StoredAnchor[];
   lang: Locale;
+  runId: string;
+  onAgent?: (agentId: string) => void;
 }): Promise<GeneratedQuestion> {
   const useCode = allowsProjectCode(input.privacy) && input.anchors.length > 0;
   const kind: "code" | "concept" = useCode ? "code" : "concept";
@@ -405,11 +412,14 @@ Write the question in ${LANGUAGE_NAME[input.lang]}.
 Return only the JSON object.`;
 
   // ⭐ 非 public 项目：这里就是代码和路径出本机的最后一道闸
-  assertNoProjectLeak(prompt, input.privacy, [input.cwd]);
+  // 交付路径在 Rumen 自己的目录下，显式放行；项目路径仍然一个字都不许出现
+  assertNoProjectLeak(prompt, input.privacy, [input.cwd], [runsDirectory()]);
 
-  const raw = await runStructured<{ prompt: string; rubric: string[] }>({
+  const { value: raw } = await runStructured<{ prompt: string; rubric: string[] }>({
     paseo: input.paseo,
     task: `quiz:${input.techName}`,
+    runId: input.runId,
+    onAgent: input.onAgent,
     prompt,
     schema: QUIZ_SCHEMA,
     cwd: input.cwd,
@@ -463,6 +473,7 @@ export async function gradeAnswer(input: {
   rubric: readonly string[];
   answer: string;
   lang: Locale;
+  runId: string;
 }): Promise<Grade> {
   const prompt = `Grade this answer against the rubric.
 
@@ -485,11 +496,13 @@ in ${LANGUAGE_NAME[input.lang]}.
 
 Return only the JSON object.`;
 
-  assertNoProjectLeak(prompt, input.privacy, [input.cwd]);
+  // 交付路径在 Rumen 自己的目录下，显式放行；项目路径仍然一个字都不许出现
+  assertNoProjectLeak(prompt, input.privacy, [input.cwd], [runsDirectory()]);
 
-  const raw = await runStructured<{ score: number; feedback: string }>({
+  const { value: raw } = await runStructured<{ score: number; feedback: string }>({
     paseo: input.paseo,
     task: "grade",
+    runId: input.runId,
     prompt,
     schema: GRADE_SCHEMA,
     cwd: input.cwd,

@@ -9,6 +9,7 @@ import {
   evidenceRpc,
   exportRpc,
   generateWikiRpc,
+  jobsRpc,
   markReviewedRpc,
   overviewRpc,
   privacyRpc,
@@ -36,6 +37,7 @@ import {
   getSettings,
   getWiki,
   listCommits,
+  listProjectJobs,
   listReviews,
   markReviewDone,
   nextQuiz,
@@ -70,6 +72,7 @@ export default function contribute(plugin: PluginContext) {
   plugin.handle(quizAnswerRpc, answerQuiz);
   plugin.handle(commitsRpc, listCommits);
   plugin.handle(reviewsRpc, listReviews);
+  plugin.handle(jobsRpc, listProjectJobs);
   plugin.handle(reviewSourceRpc, getReviewSource);
   plugin.handle(markReviewedRpc, markReviewDone);
   plugin.handle(agentImpactRpc, getAgentImpact);

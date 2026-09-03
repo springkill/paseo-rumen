@@ -14,7 +14,7 @@ import { dashboardRpc, type RumenTarget } from "./contracts.shared";
 import { Empty, ErrorCard, IdentityDot, useLocale } from "./ui.client";
 import { ProjectBody, ScanButton, type ViewContext } from "./views.client";
 
-export function RumenWorkspacePanel({ theme, host, layout, workspaceId }: PluginWorkspacePanelProps) {
+export function RumenWorkspacePanel({ theme, host, layout, workspaceId, navigation }: PluginWorkspacePanelProps) {
   const { locale, t, clientLocale, settings, refetch: refetchLocale } = useLocale(host.id);
   const workspace = useWorkspace(workspaceId, (item) => ({
     name: item.name,
@@ -87,6 +87,7 @@ export function RumenWorkspacePanel({ theme, host, layout, workspaceId }: Plugin
               data={data}
               view={view}
               settings={settings}
+              navigation={navigation}
               onRefetch={() => void dashboard.refetch()}
               onLocaleChanged={refetchLocale}
             />

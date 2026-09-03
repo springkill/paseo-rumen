@@ -13,6 +13,7 @@ import {
   resolveProvider,
 } from "./agentrun.server";
 import { collapse, identityColor, type StatusBucket } from "./buckets.shared";
+import { getJob, listJobs, startJob } from "./jobs.server";
 import { analyzeCommits, headSha, type CommitInsight } from "./commits.server";
 import { classifyPending } from "./classify.server";
 import type {
@@ -24,6 +25,7 @@ import type {
   evidenceRpc,
   exportRpc,
   generateWikiRpc,
+  jobsRpc,
   markReviewedRpc,
   overviewRpc,
   privacyRpc,
@@ -39,6 +41,7 @@ import type {
 import type {
   AgentImpact,
   Dashboard,
+  Job,
   KnowledgeNode,
   ProjectSummary,
   ReviewItem,
@@ -737,40 +740,52 @@ export async function scan(
 export async function classify(
   input: ZodOutput<typeof classifyRpc.input>,
   context: PluginHandlerContext,
-) {
+): Promise<{ job: Job | null }> {
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
   if (!allowsGeneration(project.privacy)) throw new Error(t.err_airgapped);
-  const state = await readState();
-  if (project.pending.length === 0) return { classified: 0, merged: 0 };
+  if (project.pending.length === 0) return { job: null };
 
-  let learned;
-  try {
-    learned = await classifyPending({
-      paseo: context.paseo,
-      cwd: project.root,
-      provider: state.settings.provider,
-      deferToUserAgents: state.settings.deferToUserAgents,
-      pending: project.pending,
-    });
-  } catch (error) {
-    throw new Error(describeGenerationError(error, t));
-  }
-
-  return updateState((current) => {
-    const index = new Map(current.aliases.map((item) => [learnedKey(item.pkg, item.ecosystem), item]));
-    for (const alias of learned) index.set(learnedKey(alias.pkg, alias.ecosystem), alias);
-    current.aliases = [...index.values()];
-    const merged = learned.filter((item) => item.techId !== null).length;
-    // 重扫在下一次 dashboard 请求里发生 —— 这里只清掉待归类池，让用户看到进展
-    const stored = current.projects.find((item) => item.id === project.id);
-    if (stored) {
-      const resolved = new Set(learned.map((item) => item.pkg));
-      stored.pending = stored.pending.filter((item) => !resolved.has(item.pkg.toLowerCase()));
-      stored.lastScanAt = null; // 下次 dashboard 会重扫，把新 alias 用上
+  const jobId = `classify:${project.id}`;
+  const job = startJob(jobId, { kind: "classify", projectId: project.id, techId: null }, async (running) => {
+    const state = await readState();
+    let learned;
+    try {
+      learned = await classifyPending({
+        paseo: context.paseo,
+        cwd: project.root,
+        provider: state.settings.provider,
+        deferToUserAgents: state.settings.deferToUserAgents,
+        pending: project.pending,
+        runId: jobId.replace(/[^a-zA-Z0-9]+/g, "-"),
+        onAgent: (agentId) => { running.agentId = agentId; },
+      });
+    } catch (error) {
+      throw new Error(describeGenerationError(error, t));
     }
-    return { classified: learned.length, merged };
+    await updateState((current) => {
+      const index = new Map(current.aliases.map((item) => [learnedKey(item.pkg, item.ecosystem), item]));
+      for (const alias of learned) index.set(learnedKey(alias.pkg, alias.ecosystem), alias);
+      current.aliases = [...index.values()];
+      const stored = current.projects.find((item) => item.id === project.id);
+      if (stored) {
+        const resolved = new Set(learned.map((item) => item.pkg));
+        stored.pending = stored.pending.filter((item) => !resolved.has(item.pkg.toLowerCase()));
+        // 下次 dashboard 会重扫，把新学到的 alias 用上
+        stored.lastScanAt = null;
+      }
+    });
   });
+  return { job };
+}
+
+export async function listProjectJobs(
+  input: ZodOutput<typeof jobsRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  return { jobs: listJobs(project.id) };
 }
 
 export async function setPrivacy(
@@ -864,7 +879,7 @@ export async function getWiki(
 export async function generateWikiFor(
   input: ZodOutput<typeof generateWikiRpc.input>,
   context: PluginHandlerContext,
-): Promise<Wiki> {
+): Promise<{ job: Job | null; wiki: Wiki | null }> {
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
   if (!allowsGeneration(project.privacy)) throw new Error(t.err_airgapped);
@@ -884,48 +899,55 @@ export async function generateWikiFor(
   // ⭐ Shared 层的缓存命中是跨项目的：第 100 个用 Express 的项目零成本
   if (cached && !input.force) {
     const existing = projectWiki(state, project, input.techId, input.lang);
-    if (existing) return existing;
+    if (existing) return { job: null, wiki: existing };
   }
 
-  let generated;
-  try {
-    generated = await generateWiki({
-      paseo: context.paseo,
-      cwd: project.root,
-      provider: state.settings.provider,
-      deferToUserAgents: state.settings.deferToUserAgents,
-      privacy: project.privacy,
-      techId: entity.id,
-      techName: entity.name,
-      majorVersion: major,
-      lang: input.lang,
+  // ⚠️ 生成要几分钟。**不能同步等** —— 长在请求-响应上会把界面转死，
+  // 传输层还会先超时报错。起个后台任务，界面轮询
+  const jobId = `wiki:${entity.id}@${major}#${input.lang}`;
+  const job = startJob(jobId, { kind: "wiki", projectId: project.id, techId: entity.id }, async (running) => {
+    const current = await readState();
+    let generated;
+    try {
+      generated = await generateWiki({
+        paseo: context.paseo,
+        cwd: project.root,
+        provider: current.settings.provider,
+        deferToUserAgents: current.settings.deferToUserAgents,
+        privacy: project.privacy,
+        techId: entity.id,
+        techName: entity.name,
+        majorVersion: major,
+        lang: input.lang,
+        runId: jobId.replace(/[^a-zA-Z0-9]+/g, "-"),
+        onAgent: (agentId) => { running.agentId = agentId; },
+      });
+    } catch (error) {
+      throw new Error(describeGenerationError(error, t));
+    }
+
+    await updateState((store) => {
+      store.wikis = [
+        ...store.wikis.filter(
+          (wiki) => !(wiki.techId === entity.id && wiki.lang === input.lang && wiki.majorVersion === major),
+        ),
+        generated.wiki,
+      ];
+      // ⭐ 按 id upsert，只删掉**没有证据**的陈旧占位知识点。
+      // 整体删除再重建会级联删掉用户几个月的掌握度和证据 —— 换个语言看文档
+      // 就丢掉学习记录，这是绝对不能有的。
+      const withEvidence = new Set(store.evidence.map((item) => item.nodeGroupId));
+      store.nodes = store.nodes.filter((node) =>
+        node.techId !== entity.id
+        || node.origin === "generated"
+        || withEvidence.has(node.groupId));
+      const byId = new Map(store.nodes.map((node) => [node.id, node]));
+      for (const node of generated.nodes) byId.set(node.id, node);
+      store.nodes = [...byId.values()];
     });
-  } catch (error) {
-    throw new Error(describeGenerationError(error, t));
-  }
-
-  return updateState((current) => {
-    current.wikis = [
-      ...current.wikis.filter(
-        (wiki) => !(wiki.techId === entity.id && wiki.lang === input.lang && wiki.majorVersion === major),
-      ),
-      generated.wiki,
-    ];
-    // ⭐ 按 id upsert，只删掉**没有证据**的陈旧占位知识点。
-    // 整体删除再重建会级联删掉用户几个月的掌握度和证据 —— 换个语言看文档
-    // 就丢掉学习记录，这是绝对不能有的。
-    const withEvidence = new Set(current.evidence.map((item) => item.nodeGroupId));
-    current.nodes = current.nodes.filter((node) =>
-      node.techId !== entity.id
-      || node.origin === "generated"
-      || withEvidence.has(node.groupId));
-    const byId = new Map(current.nodes.map((node) => [node.id, node]));
-    for (const node of generated.nodes) byId.set(node.id, node);
-    current.nodes = [...byId.values()];
-
-    const stored = current.projects.find((item) => item.id === project.id) ?? project;
-    return projectWiki(current, stored, entity.id, input.lang)!;
   });
+
+  return { job, wiki: null };
 }
 
 // ── 检验题 ──────────────────────────────────────────────────────────
@@ -995,6 +1017,7 @@ export async function nextQuiz(
       nodeSummary: node.summary,
       anchors: usage.evidence,
       lang,
+      runId: `quiz-${id.replace(/[^a-zA-Z0-9]+/g, "-")}`,
     });
   } catch (error) {
     throw new Error(describeGenerationError(error, t));
@@ -1057,6 +1080,7 @@ export async function answerQuiz(
         rubric: question.rubric,
         answer: input.answer,
         lang,
+        runId: `grade-${question.id.replace(/[^a-zA-Z0-9]+/g, "-")}`,
       });
     } catch {
       grade = gradeLocally(question.rubric, input.answer);

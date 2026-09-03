@@ -1,9 +1,9 @@
 import type { PaseoApi } from "@getpaseo/client";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { extractJson, GenerationBusyError, runStructured } from "./agentrun.server";
 import { analyzeCommits, matchKnowledge, readCommits, repoIdentityEmail } from "./commits.server";
@@ -33,10 +33,35 @@ test("三种 JSON 形态都认", () => {
   assert.throws(() => extractJson("no json at all"), /no parsable JSON/);
 });
 
-/** 一个可编程的假 Paseo：按脚本依次返回每次调用的最终消息。 */
-function fakePaseo(messages: string[], options: { running?: boolean } = {}): PaseoApi {
-  let call = 0;
-  return {
+const AGENT_COUNT = Symbol("createdAgents");
+
+/**
+ * 一个可编程的假 Paseo。
+ *
+ * 按脚本依次返回每一轮的最终消息；`create` 起一轮，`run` 再起一轮 ——
+ * 所以能验证"重试是不是复用同一个会话"。
+ */
+function fakePaseo(
+  messages: string[],
+  options: { running?: boolean; writesOutputFile?: string; captureOutputPath?: string[] } = {},
+): PaseoApi {
+  let turn = 0;
+  let created = 0;
+  const nextTurn = async (prompt?: string) => {
+    if (options.writesOutputFile && prompt) {
+      // agent 照交付协议写文件
+      const match = prompt.match(/^ {4}(\/\S+\.json)$/m);
+      if (match?.[1]) {
+        options.captureOutputPath?.push(match[1]);
+        await mkdir(dirname(match[1]), { recursive: true });
+        await writeFile(match[1], options.writesOutputFile, "utf8");
+      }
+    }
+    const message = messages[Math.min(turn, messages.length - 1)];
+    turn += 1;
+    return { status: "idle" as const, final: null, error: null, lastMessage: message };
+  };
+  const api = {
     providers: {
       snapshot: async () => ({ entries: [{ provider: "test", enabled: true, models: [{ id: "m", isDefault: true }] }] }),
     },
@@ -44,20 +69,32 @@ function fakePaseo(messages: string[], options: { running?: boolean } = {}): Pas
       list: async () => ({
         entries: options.running ? [{ agent: { id: "user-agent", status: "running", labels: {} } }] : [],
       }),
-      create: async () => {
-        const message = messages[Math.min(call, messages.length - 1)];
-        call += 1;
+      create: async (createOptions: { prompt?: string }) => {
+        created += 1;
+        (api as Record<symbol, number>)[AGENT_COUNT] = created;
+        let pending = nextTurn(createOptions.prompt);
         return {
-          waitForFinish: async () => ({ status: "idle", final: null, error: null, lastMessage: message }),
+          id: `rumen-agent-${created}`,
+          waitForFinish: async () => pending,
+          run: async (text: string) => {
+            pending = nextTurn(text);
+            return pending;
+          },
           archive: async () => ({ archivedAt: "" }),
         };
       },
     },
-  } as unknown as PaseoApi;
+  };
+  return api as unknown as PaseoApi;
+}
+
+function createdAgents(paseo: PaseoApi): number {
+  return (paseo as unknown as Record<symbol, number>)[AGENT_COUNT] ?? 0;
 }
 
 const RUN_BASE = {
   task: "test",
+  runId: "test-run",
   prompt: "p",
   schema: {},
   cwd: "/tmp",
@@ -90,13 +127,36 @@ test("校验不过就重试，重试完还不过就丢弃 —— 不落库", asy
   assert.equal(validations, 3, "一次加两次重试");
 });
 
-test("重试成功就返回", async () => {
+test("重试成功就返回，且全程只有一个会话", async () => {
+  const paseo = fakePaseo(["garbage", '{"ok":1}']);
   const result = await runStructured({
     ...RUN_BASE,
-    paseo: fakePaseo(["garbage", '{"ok":1}']),
+    paseo,
     validate: (value) => value as { ok: number },
   });
-  assert.deepEqual(result, { ok: 1 });
+  assert.deepEqual(result.value, { ok: 1 });
+  assert.equal(
+    createdAgents(paseo),
+    1,
+    "重试要在同一个会话里追加 —— 每次新开一个 agent 会在用户侧栏里刷屏",
+  );
+});
+
+test("claude provider 忽略 outputSchema —— 靠约定的产物文件兜住", async () => {
+  const outputs: string[] = [];
+  // 模拟 claude 的真实行为：最后一条消息是给人看的散文，没有 JSON
+  const paseo = fakePaseo(["I've researched Redis and written the guide. Let me know if you need more."], {
+    // agent 按 prompt 里的交付协议把 JSON 写进了文件
+    writesOutputFile: '{"ok":42}',
+    captureOutputPath: outputs,
+  });
+  const result = await runStructured({
+    ...RUN_BASE,
+    paseo,
+    validate: (value) => value as { ok: number },
+  });
+  assert.deepEqual(result.value, { ok: 42 }, "散文回复也没关系 —— 产物在文件里");
+  assert.ok(outputs[0]?.includes("runs/"), "交付路径要在 Rumen 自己的目录下，不碰用户仓库");
 });
 
 // ── Wiki 生成的反幻觉闸门 ───────────────────────────────────────────
@@ -118,6 +178,7 @@ function wikiPayload(overrides: Record<string, unknown> = {}) {
 }
 
 const WIKI_BASE = {
+  runId: "test-wiki",
   cwd: "/tmp",
   provider: null,
   deferToUserAgents: false,
@@ -205,6 +266,7 @@ test("兜底知识点跟随界面语言，且标明自己是占位的", () => {
 test("答案在类型上就到不了展示层", async () => {
   const generated = await generateQuestion({
     paseo: fakePaseo([JSON.stringify({ prompt: "Why does this config leak memory?", rubric: ["mentions maxmemory", "mentions eviction"] })]),
+    runId: "test-quiz",
     cwd: "/tmp",
     provider: null,
     deferToUserAgents: false,
@@ -230,6 +292,7 @@ test("public 项目才出代码题", async () => {
   });
   const code = await generateQuestion({
     paseo: fakePaseo([payload]),
+    runId: "test-quiz-code",
     cwd: "/tmp",
     provider: null,
     deferToUserAgents: false,
@@ -244,6 +307,7 @@ test("public 项目才出代码题", async () => {
 
   const degraded = await generateQuestion({
     paseo: fakePaseo([payload]),
+    runId: "test-quiz-degraded",
     cwd: "/tmp",
     provider: null,
     deferToUserAgents: false,

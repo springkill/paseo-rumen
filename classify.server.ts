@@ -99,6 +99,8 @@ export async function classifyPending(input: {
   deferToUserAgents: boolean;
   pending: readonly PendingPackage[];
   now?: number;
+  runId: string;
+  onAgent?: (agentId: string) => void;
 }): Promise<LearnedAlias[]> {
   const now = input.now ?? Date.now();
   const out: LearnedAlias[] = [];
@@ -107,9 +109,11 @@ export async function classifyPending(input: {
     const batch = input.pending.slice(offset, offset + BATCH_SIZE);
     const allowed = new Map(batch.map((item) => [item.pkg.toLowerCase(), item]));
 
-    const items = await runStructured<RawItem[]>({
+    const { value: items } = await runStructured<RawItem[]>({
       paseo: input.paseo,
       task: "classify",
+      runId: `${input.runId}-${offset}`,
+      onAgent: input.onAgent,
       prompt: prompt(batch),
       schema: SCHEMA,
       cwd: input.cwd,

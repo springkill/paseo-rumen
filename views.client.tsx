@@ -13,12 +13,13 @@
 import { type PluginTheme, useRpc } from "@getpaseo/plugin";
 import { useToast } from "@getpaseo/plugin/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { bucketLabel } from "./buckets.shared";
 import {
   classifyRpc,
   evidenceRpc,
+  jobsRpc,
   exportRpc,
   generateWikiRpc,
   privacyRpc,
@@ -28,6 +29,7 @@ import {
   updateSettingsRpc,
   wikiRpc,
   type Dashboard,
+  type Job,
   type KnowledgeNode,
   type RumenTarget,
   type Settings,
@@ -65,6 +67,68 @@ export interface ViewContext {
 
 function errorText(value: unknown): string {
   return value instanceof Error ? value.message : String(value);
+}
+
+/**
+ * 后台任务的状态条。
+ *
+ * ⚠️ 生成要几分钟。早先这里是同步 RPC + 一个转圈的 spinner —— 实机上
+ * 传输层先超时报错，然后界面永远转下去，用户完全不知道发生了什么。
+ * 现在：说清在跑、跑了多久、可以走开，失败了给一条能点进去看的链路。
+ */
+function JobBanner({ job, theme, t, navigation }: {
+  job: Job;
+  theme: PluginTheme;
+  t: Translator;
+  navigation?: { openAgent(input: { agentId: string }): void };
+}) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (job.status !== "running") return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [job.status]);
+
+  const seconds = Math.max(0, Math.round(((job.finishedAt ?? now) - job.startedAt) / 1000));
+  const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const failed = job.status === "failed";
+
+  return (
+    <Card theme={theme} accent={failed}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+        {job.status === "running" ? <ActivityIndicator size="small" color={theme.colors.accent} /> : null}
+        <Text style={{ color: failed ? theme.colors.statusDanger : theme.colors.foreground, fontWeight: "700" }}>
+          {failed ? t.job_failed : job.status === "done" ? t.job_done : t.job_running}
+        </Text>
+      </View>
+      {job.status === "running"
+        ? <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, lineHeight: 17 }}>{t.job_running_detail(elapsed)}</Text>
+        : null}
+      {job.error
+        ? <Text selectable style={{ color: theme.colors.statusDanger, fontSize: 12, lineHeight: 17 }}>{job.error}</Text>
+        : null}
+      {job.agentId && navigation
+        ? <Button label={t.job_open_session} theme={theme} subtle icon="ExternalLink" onPress={() => navigation.openAgent({ agentId: job.agentId! })} />
+        : null}
+    </Card>
+  );
+}
+
+/**
+ * 轮询这个项目的后台任务。
+ *
+ * 有任务在跑的时候三秒问一次（用户在盯着），没有的时候二十秒 —— 别白烧。
+ */
+function useJobs(view: ViewContext) {
+  const listProjectJobs = useRpc(jobsRpc);
+  const query = useQuery({
+    queryKey: ["rumen", "jobs", JSON.stringify(view.target)],
+    queryFn: () => listProjectJobs({ ...view.target, clientLocale: view.clientLocale }),
+    refetchInterval: (q) =>
+      (q.state.data?.jobs ?? []).some((job) => job.status === "running") ? 3_000 : 20_000,
+    retry: 0,
+  });
+  return query.data?.jobs ?? [];
 }
 
 // ── 行 ──────────────────────────────────────────────────────────────
@@ -224,14 +288,17 @@ function NowView({ data, theme, t, onOpenTech, onGoReview }: {
 
 // ── 技术栈 ──────────────────────────────────────────────────────────
 
-function TechView({ data, view, onSelect, onClassify, classifying }: {
+function TechView({ data, view, navigation, onSelect, onClassify, classifying }: {
   data: Dashboard;
   view: ViewContext;
+  navigation?: { openAgent(input: { agentId: string }): void };
   onSelect(id: string): void;
   onClassify(): void;
   classifying: boolean;
 }) {
   const { theme, t } = view;
+  const job = useJobs(view).find((item) => item.kind === "classify");
+  const running = job?.status === "running";
   const groups = new Map<string, Technology[]>();
   for (const item of data.technologies) {
     groups.set(item.category, [...(groups.get(item.category) ?? []), item]);
@@ -255,15 +322,16 @@ function TechView({ data, view, onSelect, onClassify, classifying }: {
           action={data.generation.available
             ? (
               <Button
-                label={classifying ? t.action_classifying : t.action_classify}
+                label={running ? t.classify_running : t.action_classify}
                 theme={theme}
                 subtle
-                disabled={classifying}
+                disabled={running || classifying}
                 onPress={onClassify}
               />
             )
             : undefined}
         >
+          {job ? <JobBanner job={job} theme={theme} t={t} navigation={navigation} /> : null}
           <Card theme={theme}>
             <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, lineHeight: 18 }}>
               {data.pending.slice(0, 40).map((item) => item.pkg).join(" · ")}
@@ -277,12 +345,15 @@ function TechView({ data, view, onSelect, onClassify, classifying }: {
 
 // ── Wiki ────────────────────────────────────────────────────────────
 
-function WikiBox({ tech, view, onRead }: {
+function WikiBox({ tech, view, navigation, onRead }: {
   tech: Technology;
   view: ViewContext;
+  navigation?: { openAgent(input: { agentId: string }): void };
   onRead(node: KnowledgeNode): void;
 }) {
   const { target, clientLocale, locale, theme, t } = view;
+  const jobs = useJobs(view);
+  const job = jobs.find((item) => item.kind === "wiki" && item.techId === tech.id);
   const getWiki = useRpc(wikiRpc);
   const generate = useRpc(generateWikiRpc);
   const queryClient = useQueryClient();
@@ -295,10 +366,19 @@ function WikiBox({ tech, view, onRead }: {
   });
   const generating = useMutation({
     mutationFn: (lang: Locale) => generate({ ...target, clientLocale, techId: tech.id, lang, force: false }),
+    // 生成是后台任务，这里只是把它**起起来** —— 结果靠轮询 job 拿
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["rumen"] }),
     onError: (error) => toast.error(errorText(error)),
   });
 
+  // 任务跑完了就把 wiki 重新取一次
+  useEffect(() => {
+    if (job?.status === "done") {
+      void queryClient.invalidateQueries({ queryKey: ["rumen", "wiki"] });
+    }
+  }, [job?.status, job?.finishedAt, queryClient]);
+
+  const running = job?.status === "running";
   const doc = wiki.data;
   return (
     <Section
@@ -307,21 +387,17 @@ function WikiBox({ tech, view, onRead }: {
       theme={theme}
       action={
         <Button
-          label={generating.isPending ? t.wiki_generating : doc ? t.action_regenerate_wiki : t.action_generate_wiki}
+          label={running ? t.job_running : doc ? t.action_regenerate_wiki : t.action_generate_wiki}
           theme={theme}
           subtle={Boolean(doc)}
-          disabled={generating.isPending}
+          disabled={running || generating.isPending}
           onPress={() => generating.mutate(locale)}
         />
       }
     >
-      {generating.isPending
-        ? (
-          <Card theme={theme}>
-            <ActivityIndicator color={theme.colors.accent} />
-            <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, lineHeight: 18 }}>{t.wiki_generating_hint}</Text>
-          </Card>
-        )
+      {job ? <JobBanner job={job} theme={theme} t={t} navigation={navigation} /> : null}
+      {running
+        ? <Text style={{ color: theme.colors.foregroundMuted, fontSize: 12, lineHeight: 18 }}>{t.wiki_generating_hint}</Text>
         : null}
       {generating.error ? <ErrorCard error={generating.error} theme={theme} t={t} /> : null}
       {wiki.isLoading ? <ActivityIndicator color={theme.colors.accent} /> : null}
@@ -386,7 +462,7 @@ function WikiBox({ tech, view, onRead }: {
             ) : null}
           </View>
         )
-        : !generating.isPending ? <Empty text={t.wiki_absent} theme={theme} /> : null}
+        : !running ? <Empty text={t.wiki_absent} theme={theme} /> : null}
 
       <Section title={t.wiki_in_this_project} subtitle={t.stack_evidence_count(tech.evidence.length)} theme={theme}>
         {tech.evidence.slice(0, 15).map((anchor) => (
@@ -774,10 +850,12 @@ function SettingsView({ data, settings, view, onLocaleChanged }: {
  *
  * 两个壳共用它：workspace 面板包一层 workspace 头，全局界面包一层项目详情头。
  */
-export function ProjectBody({ data, view, settings, onRefetch, onLocaleChanged }: {
+export function ProjectBody({ data, view, settings, navigation, onRefetch, onLocaleChanged }: {
   data: Dashboard;
   view: ViewContext;
   settings: Settings | undefined;
+  /** 用来从任务卡片跳去看 Rumen 起的那个会话。老宿主机上可能没有。 */
+  navigation?: { openAgent(input: { agentId: string }): void };
   onRefetch(): void;
   onLocaleChanged(): void;
 }) {
@@ -791,10 +869,8 @@ export function ProjectBody({ data, view, settings, onRefetch, onLocaleChanged }
 
   const classify = useMutation({
     mutationFn: () => classifyPending({ ...target, clientLocale }),
-    onSuccess(value) {
-      toast.show(t.classify_done(value.merged), { variant: "success" });
-      void queryClient.invalidateQueries({ queryKey: ["rumen"] });
-    },
+    // 后台任务，这里只负责起 —— 进度由 TechView 里的任务卡片显示
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["rumen", "jobs"] }),
     onError: (error) => toast.error(errorText(error)),
   });
   const evidence = useMutation({
@@ -846,7 +922,7 @@ export function ProjectBody({ data, view, settings, onRefetch, onLocaleChanged }
           ? (
             <View style={{ gap: 16 }}>
               <Button label={t.stack_back} icon="ChevronLeft" theme={theme} subtle onPress={() => setSelectedTech(null)} />
-              <WikiBox tech={selected} view={view} onRead={(node) => evidence.mutate(node)} />
+              <WikiBox tech={selected} view={view} navigation={navigation} onRead={(node) => evidence.mutate(node)} />
               <QuizBox tech={selected} view={view} codeQuizAllowed={data.generation.codeQuizAllowed} onChanged={onRefetch} />
             </View>
           )
@@ -854,6 +930,7 @@ export function ProjectBody({ data, view, settings, onRefetch, onLocaleChanged }
             <TechView
               data={data}
               view={view}
+              navigation={navigation}
               onSelect={setSelectedTech}
               onClassify={() => classify.mutate()}
               classifying={classify.isPending}

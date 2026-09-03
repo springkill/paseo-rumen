@@ -93,6 +93,7 @@ function ProjectDetail({ project, view, settings, hostId, navigation, onBack, on
             data={data}
             view={view}
             settings={settings}
+            navigation={navigation}
             onRefetch={() => void dashboard.refetch()}
             onLocaleChanged={onLocaleChanged}
           />
