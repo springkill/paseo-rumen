@@ -921,6 +921,7 @@ export async function generateWikiFor(
         lang: input.lang,
         runId: jobId.replace(/[^a-zA-Z0-9]+/g, "-"),
         onAgent: (agentId) => { running.agentId = agentId; },
+        ignoreExistingArtifact: input.force,
       });
     } catch (error) {
       throw new Error(describeGenerationError(error, t));

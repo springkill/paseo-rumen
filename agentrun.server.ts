@@ -220,6 +220,8 @@ export interface RunOptions<T> {
   retries?: number;
   /** 用来生成落盘路径，同时也是这次运行的 id。 */
   runId: string;
+  /** 重新生成时置 true —— 否则会直接捡起上次留下的产物。 */
+  ignoreExistingArtifact?: boolean;
   /** 会话建好之后回调一次，让调用方把 agentId 记进任务状态。 */
   onAgent?: (agentId: string) => void;
 }
@@ -227,6 +229,21 @@ export interface RunOptions<T> {
 export interface RunResult<T> {
   value: T;
   agentId: string | null;
+}
+
+/** 一轮的结果。`null` = 那一轮我们没等到（超时或出错）。 */
+type TurnOutcome = { status: string; error: string | null; lastMessage: string | null } | null;
+interface Settled {
+  file: unknown | null;
+  turn: TurnOutcome;
+}
+
+function asOutcome(result: {
+  status: string;
+  error: string | null;
+  lastMessage: string | null;
+}): TurnOutcome {
+  return result;
 }
 
 async function readOutputFile(path: string): Promise<unknown | null> {
@@ -239,31 +256,65 @@ async function readOutputFile(path: string): Promise<unknown | null> {
   }
 }
 
+/**
+ * 等产物文件出现。每 3 秒看一眼 —— 它是 agent 唯一必须精确产出的东西。
+ *
+ * ⚠️ **必须可取消。** 它常和"等轮次结束"一起 `Promise.race`，输的那一边
+ * 如果继续轮询，就会留一串定时器挂到 deadline（wiki 是 45 分钟）——
+ * 进程退不掉，测试直接卡死。
+ */
+async function waitForArtifact(
+  path: string,
+  deadline: number,
+  cancelled: { value: boolean },
+): Promise<unknown | null> {
+  for (;;) {
+    if (cancelled.value) return null;
+    const value = await readOutputFile(path);
+    if (value !== null) return value;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || cancelled.value) return null;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(3_000, remaining)));
+  }
+}
+
 export async function runStructured<T>(options: RunOptions<T>): Promise<RunResult<T>> {
   const shouldYield = options.initiator === "background" && options.deferToUserAgents;
   if (shouldYield && await userAgentsBusy(options.paseo)) {
     throw new GenerationBusyError();
   }
-  const provider = await resolveProvider(options.paseo, options.provider);
-  const release = await acquire();
   const outputPath = outputPathFor(options.runId);
   await mkdir(runsDirectory(), { recursive: true, mode: 0o700 });
-  await rm(outputPath, { force: true }).catch(() => {});
+
+  // ⭐ 上一次可能是我们先放弃、agent 后写完 —— 产物还躺在那儿。
+  // 先捡一次：这让"再点一下重试"能零成本命中，而不是重新烧一遍配额。
+  if (!options.ignoreExistingArtifact) {
+    const existing = await readOutputFile(outputPath);
+    if (existing !== null) {
+      try {
+        const value = options.validate(existing);
+        await rm(outputPath, { force: true }).catch(() => {});
+        return { value, agentId: null };
+      } catch {
+        // 存着的那份本来就不合格，删掉重来
+        await rm(outputPath, { force: true }).catch(() => {});
+      }
+    }
+  } else {
+    await rm(outputPath, { force: true }).catch(() => {});
+  }
+
+  const provider = await resolveProvider(options.paseo, options.provider);
+  const release = await acquire();
 
   try {
     // ⚠️ **不要在 create 里带 prompt。**
     //
     // `create({prompt})` 之后紧接着 `waitForFinish()` 有竞态：那一轮还没在
     // daemon 里建立起来，`waitForFinish` 就直接返回 idle。实机上的后果是
-    // 8 秒内烧光三次重试 —— 第一次"没产出"，第二次撞上 "already has an active
-    // run"，第三次把正在搜索的 agent 强杀（transcript 里留下
-    // "[Request interrupted by user for tool use]"）。
+    // 8 秒内烧光三次重试，最后把正在搜索的 agent 强杀。
     //
-    // `run(text)` 是 `sendAgentMessage` + `waitForFinish`：send 先把这一轮
-    // 建立起来，然后才等。用它就没有这个窗口。
-    //
-    // 同理不设 `autoArchive` —— 实机上它在第 11 秒就把会话收走了，
-    // 而 agent 还在干活。收尾我们自己按结果决定。
+    // 同理不设 `autoArchive` —— 实机上它在第 11 秒就把会话收走了。
     const handle = await options.paseo.agents.create({
       config: { provider },
       cwd: options.cwd,
@@ -273,11 +324,12 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
     });
     options.onAgent?.(handle.id);
 
+    const deadline = Date.now() + options.timeoutMs;
     let lastError: unknown = null;
     const attempts = (options.retries ?? 2) + 1;
     const firstPrompt = `${options.prompt}${deliveryInstruction(outputPath)}`;
 
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
+    for (let attempt = 0; attempt < attempts && Date.now() < deadline; attempt += 1) {
       const text = attempt === 0
         ? firstPrompt
         // ⭐ 重试在**同一个会话**里追加，不新开 agent
@@ -285,56 +337,69 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
           lastError instanceof Error ? lastError.message : String(lastError)
         }). Write the corrected JSON object to ${outputPath} and reply with just \`DONE\`.`;
 
-      let finished;
+      // ⭐ **盯产物文件，不是盯轮次。**
+      //
+      // 交付物是那个文件；轮次结束只是"该停止等待了"的其中一个信号。
+      // 实机踩过：一次 Spring Boot wiki 跑了 20 分钟，我按 15 分钟的轮次超时
+      // 判了失败，而 agent 五分钟后才把文件写完 —— 内容是好的，被我丢了。
+      const raceArtifact = async (turn: Promise<TurnOutcome>): Promise<Settled> => {
+        const cancelled = { value: false };
+        try {
+          const first = await Promise.race([
+            turn.then((result) => ({ kind: "turn" as const, result })),
+            waitForArtifact(outputPath, deadline, cancelled).then((value) => ({ kind: "file" as const, value })),
+          ]);
+          if (first.kind === "file" && first.value !== null) return { file: first.value, turn: null };
+          // 轮次先结束：再看一眼文件，它可能刚落地
+          const settledTurn = first.kind === "turn" ? first.result : await turn;
+          return { file: await readOutputFile(outputPath), turn: settledTurn };
+        } finally {
+          // 不管谁先到，都把轮询停掉 —— 否则定时器挂到 deadline
+          cancelled.value = true;
+        }
+      };
+
+      const finish = (value: unknown): Promise<T> => Promise.resolve(options.validate(value));
+      const succeed = async (value: unknown): Promise<RunResult<T>> => {
+        const parsed = await finish(value);
+        await handle.archive().catch(() => {});
+        await rm(outputPath, { force: true }).catch(() => {});
+        return { value: parsed, agentId: handle.id };
+      };
+
+      let settled: Settled;
       try {
-        finished = await handle.run(text, { timeoutMs: options.timeoutMs });
+        settled = await raceArtifact(
+          handle.run(text, { timeoutMs: Math.max(1, deadline - Date.now()) }).then(asOutcome),
+        );
       } catch (error) {
-        // 上一轮其实还在跑（send 撞上活动轮次）—— 等它，而不是把这次重试烧掉
+        // send 撞上活动轮次说明上一轮其实还在跑 —— 去等那一轮，别烧重试次数
         if (error instanceof Error && /already has an active run/i.test(error.message)) {
-          try {
-            finished = await handle.waitForFinish(options.timeoutMs);
-          } catch (waitError) {
-            lastError = waitError;
-            continue;
-          }
+          settled = await raceArtifact(
+            handle.waitForFinish(Math.max(1, deadline - Date.now())).then(asOutcome).catch(() => null),
+          );
         } else {
           lastError = error;
           continue;
         }
       }
 
-      if (finished.status === "timeout") {
-        lastError = new Error(`agent did not finish within ${Math.round(options.timeoutMs / 1000)}s`);
-        continue;
-      }
-      if (finished.status === "error") {
-        lastError = new Error(finished.error ?? "agent reported an error");
-        continue;
-      }
-
-      // ① 约定的产物文件
-      const fromFile = await readOutputFile(outputPath);
-      if (fromFile !== null) {
+      if (settled.file !== null) {
         try {
-          const value = options.validate(fromFile);
-          // 成功了就把会话和产物都收掉 —— 内容已经进 Rumen 了。
-          // 失败的**都留着**：会话给用户看 agent 做了什么，
-          // 产物文件给排查用（"它到底写了什么才校验不过"）
-          await handle.archive().catch(() => {});
-          await rm(outputPath, { force: true }).catch(() => {});
-          return { value, agentId: handle.id };
+          return await succeed(settled.file);
         } catch (error) {
           lastError = error;
           continue;
         }
       }
-      // ② 退回去解析最后一条消息 —— provider 真的照 outputSchema 吐了 JSON 时走这条
-      if (finished.lastMessage?.trim()) {
+      if (settled.turn?.status === "error") {
+        lastError = new Error(settled.turn.error ?? "agent reported an error");
+        continue;
+      }
+      // provider 真的照 outputSchema 吐了 JSON 时走这条
+      if (settled.turn?.lastMessage?.trim()) {
         try {
-          const value = options.validate(extractJson(finished.lastMessage));
-          await handle.archive().catch(() => {});
-          await rm(outputPath, { force: true }).catch(() => {});
-          return { value, agentId: handle.id };
+          return await succeed(extractJson(settled.turn.lastMessage));
         } catch (error) {
           lastError = error;
           continue;
@@ -343,6 +408,8 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
       lastError = new Error(`agent produced neither ${outputPath} nor a parsable final message`);
     }
 
+    // ⚠️ 失败时**不删产物、不归档会话**：agent 可能还在跑，等它写完，
+    // 下次点重试就能零成本捡起来（见函数开头那段）
     throw new GenerationInvalidError(
       lastError instanceof Error ? lastError.message : String(lastError),
     );

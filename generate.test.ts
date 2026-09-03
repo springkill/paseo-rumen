@@ -2,6 +2,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -23,6 +24,10 @@ import type { StoredNode, StoredProject, StoredTechEntity } from "./store.server
 import test from "node:test";
 
 const exec = promisify(execFile);
+
+// ⚠️ 涉及产物文件的用例会真的读写 dataDirectory()。隔离掉，
+// 否则会动到用户 ~/.paseo 下的真实状态
+process.env.RUMEN_DATA_DIR ??= mkdtempSync(join(tmpdir(), "rumen-generate-test-"));
 
 // ── agent 输出的解析与校验 ──────────────────────────────────────────
 
@@ -639,4 +644,54 @@ test("撞上活动轮次时等它，而不是把重试烧掉", async () => {
   });
   assert.deepEqual(result.value, { ok: 9 });
   assert.equal(calls, 1, "第一次就该等出结果，不该继续重试");
+});
+
+test("⭐ 捡起上次遗留的产物 —— 我们先放弃、agent 后写完的情况", async () => {
+  // 实机就是这么卡住的：轮次超时判失败，agent 五分钟后才写完文件。
+  // 内容是好的，躺在那儿。再点一次不该重新烧一遍配额
+  const { outputPathFor, runsDirectory } = await import("./agentrun.server");
+  const path = outputPathFor("leftover-case");
+  await mkdir(runsDirectory(), { recursive: true });
+  await writeFile(path, '{"ok":123}', "utf8");
+
+  let created = 0;
+  const paseo = {
+    providers: { snapshot: async () => ({ entries: [{ provider: "t", enabled: true, models: [{ id: "m" }] }] }) },
+    agents: { list: async () => ({ entries: [] }), create: async () => { created += 1; throw new Error("不该走到这里"); } },
+  } as unknown as PaseoApi;
+
+  const result = await runStructured({
+    ...RUN_BASE,
+    runId: "leftover-case",
+    initiator: "user",
+    paseo,
+    validate: (value) => value as { ok: number },
+  });
+  assert.deepEqual(result.value, { ok: 123 });
+  assert.equal(created, 0, "有现成的合格产物就不该再起 agent");
+  assert.equal(result.agentId, null);
+  await rm(path, { force: true });
+});
+
+test("遗留产物不合格就删掉重来，不会卡在坏文件上", async () => {
+  const { outputPathFor, runsDirectory } = await import("./agentrun.server");
+  const path = outputPathFor("leftover-bad");
+  await mkdir(runsDirectory(), { recursive: true });
+  await writeFile(path, '{"garbage":true}', "utf8");
+
+  const paseo = fakePaseo(['{"ok":5}']);
+  const result = await runStructured({
+    ...RUN_BASE,
+    runId: "leftover-bad",
+    initiator: "user",
+    paseo,
+    validate(value) {
+      const item = value as { ok?: number };
+      if (typeof item.ok !== "number") throw new Error("missing ok");
+      return item as { ok: number };
+    },
+  });
+  assert.deepEqual(result.value, { ok: 5 }, "坏产物删掉之后正常走 agent");
+  assert.equal(createdAgents(paseo), 1);
+  await rm(path, { force: true });
 });

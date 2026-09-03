@@ -47,8 +47,14 @@ export const QUIZ_PASS_THRESHOLD = 0.7;
 
 const LANGUAGE_NAME: Record<Locale, string> = { zh: "Simplified Chinese", en: "English" };
 
-/** 生成一篇 wiki 的超时。要联网搜多次再写长文，给足。 */
-const WIKI_TIMEOUT_MS = 900_000;
+/**
+ * 生成一篇 wiki 的超时。
+ *
+ * ⚠️ 实测一次 Spring Boot（14 个知识点、18 条来源）跑了 **20 分钟**。
+ * 原来给 15 分钟，正好卡在中间把好内容判成失败。要联网搜多轮再写长文，
+ * 这个数就得按最坏情况给。
+ */
+const WIKI_TIMEOUT_MS = 45 * 60_000;
 const QUIZ_TIMEOUT_MS = 300_000;
 
 export function majorVersionOf(version: string | null): string {
@@ -196,6 +202,8 @@ export async function generateWiki(input: {
   now?: number;
   runId: string;
   onAgent?: (agentId: string) => void;
+  /** 重新生成：别捡上次留下的产物。 */
+  ignoreExistingArtifact?: boolean;
 }): Promise<GeneratedWiki> {
   const now = input.now ?? Date.now();
   const prompt = wikiPrompt(input.techName, input.majorVersion, input.lang);
@@ -207,6 +215,7 @@ export async function generateWiki(input: {
     task: `wiki:${input.techName}`,
     runId: input.runId,
     onAgent: input.onAgent,
+    ignoreExistingArtifact: input.ignoreExistingArtifact,
     prompt,
     schema: WIKI_SCHEMA,
     cwd: input.cwd,
