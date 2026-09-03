@@ -72,10 +72,14 @@ function fakePaseo(
       create: async (createOptions: { prompt?: string }) => {
         created += 1;
         (api as Record<symbol, number>)[AGENT_COUNT] = created;
-        let pending = nextTurn(createOptions.prompt);
+        // ⚠️ 真实的 create 之后那一轮还没建立起来。这里如实模拟：
+        // 没发过消息就 waitForFinish 的话，拿到的是"啥也没有"
+        if (createOptions.prompt) throw new Error("create must not carry a prompt: the turn is not established yet");
+        let pending: Promise<{ status: "idle"; final: null; error: null; lastMessage: string | undefined }> | null = null;
         return {
           id: `rumen-agent-${created}`,
-          waitForFinish: async () => pending,
+          waitForFinish: async () =>
+            pending ?? { status: "idle" as const, final: null, error: null, lastMessage: undefined },
           run: async (text: string) => {
             pending = nextTurn(text);
             return pending;
@@ -591,4 +595,48 @@ test("知识点还没有符号可匹配时，正面证据不产生 —— 这是
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("create 不带 prompt —— 那一轮还没建立起来就 waitForFinish 会秒返回", async () => {
+  // 实机故障复刻：create({prompt}) + waitForFinish() 有竞态，8 秒内烧光三次重试，
+  // 最后一次把正在搜索的 agent 强杀了。fakePaseo 里 create 带 prompt 直接抛错，
+  // 所以这个用例能过就说明我们没退回那种写法
+  const paseo = fakePaseo(['{"ok":7}']);
+  const result = await runStructured({
+    ...RUN_BASE,
+    initiator: "user",
+    paseo,
+    validate: (value) => value as { ok: number },
+  });
+  assert.deepEqual(result.value, { ok: 7 });
+  assert.equal(createdAgents(paseo), 1);
+});
+
+test("撞上活动轮次时等它，而不是把重试烧掉", async () => {
+  let calls = 0;
+  const paseo = {
+    providers: { snapshot: async () => ({ entries: [{ provider: "t", enabled: true, models: [{ id: "m", isDefault: true }] }] }) },
+    agents: {
+      list: async () => ({ entries: [] }),
+      create: async () => ({
+        id: "a1",
+        run: async () => {
+          calls += 1;
+          throw new Error("Agent a1 already has an active run");
+        },
+        // 上一轮其实跑完了，结果在这儿
+        waitForFinish: async () => ({ status: "idle", final: null, error: null, lastMessage: '{"ok":9}' }),
+        archive: async () => ({ archivedAt: "" }),
+      }),
+    },
+  } as unknown as PaseoApi;
+
+  const result = await runStructured({
+    ...RUN_BASE,
+    initiator: "user",
+    paseo,
+    validate: (value) => value as { ok: number },
+  });
+  assert.deepEqual(result.value, { ok: 9 });
+  assert.equal(calls, 1, "第一次就该等出结果，不该继续重试");
 });

@@ -251,36 +251,56 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
   await rm(outputPath, { force: true }).catch(() => {});
 
   try {
+    // ⚠️ **不要在 create 里带 prompt。**
+    //
+    // `create({prompt})` 之后紧接着 `waitForFinish()` 有竞态：那一轮还没在
+    // daemon 里建立起来，`waitForFinish` 就直接返回 idle。实机上的后果是
+    // 8 秒内烧光三次重试 —— 第一次"没产出"，第二次撞上 "already has an active
+    // run"，第三次把正在搜索的 agent 强杀（transcript 里留下
+    // "[Request interrupted by user for tool use]"）。
+    //
+    // `run(text)` 是 `sendAgentMessage` + `waitForFinish`：send 先把这一轮
+    // 建立起来，然后才等。用它就没有这个窗口。
+    //
+    // 同理不设 `autoArchive` —— 实机上它在第 11 秒就把会话收走了，
+    // 而 agent 还在干活。收尾我们自己按结果决定。
     const handle = await options.paseo.agents.create({
       config: { provider },
       cwd: options.cwd,
-      prompt: `${options.prompt}${deliveryInstruction(outputPath)}`,
       outputSchema: options.schema,
       title: `Rumen · ${options.task}`,
       labels: { "rumen.task": options.task },
-      autoArchive: true,
     });
     options.onAgent?.(handle.id);
 
     let lastError: unknown = null;
     const attempts = (options.retries ?? 2) + 1;
+    const firstPrompt = `${options.prompt}${deliveryInstruction(outputPath)}`;
 
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const text = attempt === 0
+        ? firstPrompt
+        // ⭐ 重试在**同一个会话**里追加，不新开 agent
+        : `That attempt did not produce a usable result (${
+          lastError instanceof Error ? lastError.message : String(lastError)
+        }). Write the corrected JSON object to ${outputPath} and reply with just \`DONE\`.`;
+
       let finished;
       try {
-        finished = attempt === 0
-          // create 已经带 prompt 起过一轮了，这里只等它结束
-          ? await handle.waitForFinish(options.timeoutMs)
-          // ⭐ 重试在**同一个会话**里追加，不新开 agent
-          : await handle.run(
-            `That attempt did not produce a usable result (${
-              lastError instanceof Error ? lastError.message : String(lastError)
-            }). Write the corrected JSON object to ${outputPath} and reply with just \`DONE\`.`,
-            { timeoutMs: options.timeoutMs },
-          );
+        finished = await handle.run(text, { timeoutMs: options.timeoutMs });
       } catch (error) {
-        lastError = error;
-        continue;
+        // 上一轮其实还在跑（send 撞上活动轮次）—— 等它，而不是把这次重试烧掉
+        if (error instanceof Error && /already has an active run/i.test(error.message)) {
+          try {
+            finished = await handle.waitForFinish(options.timeoutMs);
+          } catch (waitError) {
+            lastError = waitError;
+            continue;
+          }
+        } else {
+          lastError = error;
+          continue;
+        }
       }
 
       if (finished.status === "timeout") {
@@ -297,9 +317,11 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
       if (fromFile !== null) {
         try {
           const value = options.validate(fromFile);
-          // 成功了就把会话收掉 —— 产物已经存进 Rumen，会话没有别的价值了。
-          // 失败的**不收**：用户要能点进去看它到底答了什么
+          // 成功了就把会话和产物都收掉 —— 内容已经进 Rumen 了。
+          // 失败的**都留着**：会话给用户看 agent 做了什么，
+          // 产物文件给排查用（"它到底写了什么才校验不过"）
           await handle.archive().catch(() => {});
+          await rm(outputPath, { force: true }).catch(() => {});
           return { value, agentId: handle.id };
         } catch (error) {
           lastError = error;
@@ -311,6 +333,7 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
         try {
           const value = options.validate(extractJson(finished.lastMessage));
           await handle.archive().catch(() => {});
+          await rm(outputPath, { force: true }).catch(() => {});
           return { value, agentId: handle.id };
         } catch (error) {
           lastError = error;
@@ -324,7 +347,6 @@ export async function runStructured<T>(options: RunOptions<T>): Promise<RunResul
       lastError instanceof Error ? lastError.message : String(lastError),
     );
   } finally {
-    await rm(outputPath, { force: true }).catch(() => {});
     release();
   }
 }
