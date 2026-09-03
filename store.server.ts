@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { EvidenceKind, Privacy } from "./domain.shared";
 import type { Locale } from "./i18n.shared";
+import { forbiddenRoot } from "./roots.server";
 import type { LearnedAlias, PendingPackage, TechCategory } from "./techmap.shared";
 
 export interface StoredAnchor {
@@ -263,6 +264,9 @@ function migrateV1(value: Record<string, unknown>): RumenState {
     const id = typeof project.id === "string" ? project.id : null;
     const root = typeof project.root === "string" ? project.root : null;
     if (!id || !root) return [];
+    // 家目录那类根本扫不了的目录，留着只会在总览里挂一个永远 0 技术栈、
+    // 一点扫描就报错的空项目。它从来没有过有效数据，丢掉不是丢数据
+    if (forbiddenRoot(root)) return [];
     return [{
       id,
       workspaceIds: list<string>(project.workspaceIds).filter((item) => typeof item === "string"),
@@ -335,10 +339,14 @@ async function loadUnqueued(): Promise<RumenState> {
   if ("migrateFrom" in result) {
     const backup = `${path}.v1-${Date.now()}`;
     await writeFile(backup, raw, { encoding: "utf8", mode: 0o600 }).catch(() => {});
+    cached = result.state;
+    // ⚠️ 迁移必须**立刻落盘**，不能只改内存。
+    // 只改内存的话磁盘上仍是 v1，下次加载又迁移一遍 —— 每次 reload 多留一份
+    // 全量备份。实机上两次 reload 就把这个目录从 7.8MB 堆到 23MB。
+    await persist(result.state);
     console.warn(
       `[rumen] migrated state v1 → v2. v1's technology and concept data came from a scanner that turned every package into its own technology, so it was dropped; projects and privacy levels were kept. The original file is at ${backup}. Re-scan each workspace to rebuild.`,
     );
-    cached = result.state;
     return cached;
   }
   cached = result;

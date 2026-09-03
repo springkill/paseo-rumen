@@ -1,11 +1,12 @@
 {
   "name": "paseo-rumen",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A local-first software engineering knowledge layer for Paseo",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test *.test.ts"
+    "test": "tsx --test *.test.ts",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
     "@getpaseo/client": "^0.7.0",

@@ -8,6 +8,7 @@ import { ingestMutations, markReviewed, mutationFrom, verdictBucket } from "./ob
 import { ScanBoundaryError, scanWorkspace } from "./scanner.server";
 import {
   exportKnowledge,
+  resetCommitCacheForTests,
   getAgentImpact,
   getDashboard,
   getReviewSource,
@@ -86,11 +87,13 @@ async function withStore<T>(run: (data: string) => Promise<T>): Promise<T> {
   const data = await mkdtemp(join(tmpdir(), "paseo-rumen-data-"));
   process.env.RUMEN_DATA_DIR = data;
   resetStoreForTests();
+  resetCommitCacheForTests();
   try {
     return await run(data);
   } finally {
     delete process.env.RUMEN_DATA_DIR;
     resetStoreForTests();
+    resetCommitCacheForTests();
     await rm(data, { recursive: true, force: true });
   }
 }
@@ -126,6 +129,40 @@ test("每个包不再各自成一个技术栈 —— 未命中的进待归类池
     assert.deepEqual(react.packages.sort(), ["react", "react-dom"]);
     // 两个不认识的包进待归类池，不是技术栈
     assert.deepEqual(result.pending.map((item) => item.pkg).sort(), ["acme-internal-widget", "another-unknown-lib"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("多个包并到一个技术栈时，版本取最规范的那个包", async () => {
+  const root = await mkdtemp(join(tmpdir(), "paseo-rumen-version-"));
+  try {
+    // tsx 和 typescript 都归到 tech:typescript。tsx 在前，
+    // 取"数组第一个"会显示出 TypeScript@^4.20.6 —— 一个不存在的版本号
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({ devDependencies: { tsx: "^4.20.6", typescript: "^5.9.3" } }),
+    );
+    const result = await scanWorkspace(root, false);
+    const ts = result.technologies.find((item) => item.techId === "tech:typescript")!;
+    assert.equal(ts.version, "^5.9.3", "版本要来自 typescript 本身，不是 tsx");
+    assert.deepEqual(ts.packages.sort(), ["tsx", "typescript"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("前缀命中不比精确命中权威", async () => {
+  const root = await mkdtemp(join(tmpdir(), "paseo-rumen-prefix-"));
+  try {
+    // @types/react 是前缀命中，react 是精确命中 —— 版本该取 react 的
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify({ dependencies: { "@types/react": "~19.2.0", react: "19.1.0" } }),
+    );
+    const result = await scanWorkspace(root, false);
+    const react = result.technologies.find((item) => item.techId === "tech:react")!;
+    assert.equal(react.version, "19.1.0");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -429,6 +466,17 @@ test("v1 迁移保留项目身份，丢弃坏掉的技术栈数据，并留下�
     const v1 = {
       version: 1,
       projects: [{
+        // 家目录被当成 workspace 打开过一次留下的事故产物：它扫不了，
+        // 留着只会在总览里挂一个永远报错的空项目
+        id: "path:" + homedir(),
+        workspaceIds: [],
+        name: "test",
+        root: homedir(),
+        privacy: "private",
+        lastScanAt: 1,
+        truncated: true,
+        technologies: [],
+      }, {
         id: "git:github.com/acme/repo",
         workspaceIds: ["w1"],
         name: "repo",
@@ -448,7 +496,7 @@ test("v1 迁移保留项目身份，丢弃坏掉的技术栈数据，并留下�
 
     const state = await readState();
     assert.equal(state.version, 2);
-    assert.equal(state.projects.length, 1);
+    assert.equal(state.projects.length, 1, "家目录那条事故产物被丢掉了");
     assert.equal(state.projects[0]?.id, "git:github.com/acme/repo", "项目身份要留住");
     assert.equal(state.projects[0]?.privacy, "public", "隐私级别是用户设的，要留住");
     assert.equal(state.projects[0]?.technologies.length, 0, "伪技术栈全部丢弃");
@@ -459,6 +507,29 @@ test("v1 迁移保留项目身份，丢弃坏掉的技术栈数据，并留下�
     const { readdir } = await import("node:fs/promises");
     const files = await readdir(data);
     assert.ok(files.some((name) => name.includes(".v1-")), "原文件要另存一份，用户想捞随时能捞");
+  });
+});
+
+test("迁移只发生一次 —— 立刻落盘，不是只改内存", async () => {
+  await withStore(async (data) => {
+    await mkdir(data, { recursive: true });
+    await writeFile(
+      statePath(),
+      JSON.stringify({ version: 1, projects: [{ id: "path:/tmp/x", root: "/tmp/x", name: "x" }] }),
+      "utf8",
+    );
+    const { readdir } = await import("node:fs/promises");
+
+    await readState();
+    resetStoreForTests(); // 模拟一次插件 reload
+    await readState();
+    resetStoreForTests();
+    await readState();
+
+    const backups = (await readdir(data)).filter((name) => name.includes(".v1-"));
+    assert.equal(backups.length, 1, "只改内存的话每次 reload 都会重新迁移并再留一份全量备份");
+    const onDisk = JSON.parse(await readFile(statePath(), "utf8"));
+    assert.equal(onDisk.version, 2, "磁盘上必须已经是 v2");
   });
 });
 

@@ -110,6 +110,12 @@ export async function readCommits(root: string, limit: number): Promise<CommitRe
   return commits;
 }
 
+/** 当前 HEAD。用来判断上次分析结果还算不算数。 */
+export async function headSha(root: string): Promise<string | null> {
+  const value = await git(root, ["rev-parse", "HEAD"]);
+  return value?.trim() || null;
+}
+
 export async function repoIdentityEmail(root: string): Promise<string | null> {
   const value = await git(root, ["config", "user.email"]);
   return value?.trim() || null;
@@ -158,8 +164,15 @@ function observationWindow(
  * ② 确定性预筛 + ③ 知识点匹配。
  *
  * - 技术命中：改到了它证据锚点所在的文件，**或**它的名字出现在 diff 正文里
- * - 知识点命中：`symbols` 做 **FQN-exact** 匹配（全词边界），
- *   短名和关键词只用来做文件级粗筛，不参与链路判定
+ * - 知识点命中分两档：
+ *   - `exactNodeGroupIds`：`symbols` 做 **FQN-exact** 匹配（全词边界）
+ *   - `coarseNodeGroupIds`：命中技术下的全部知识点，**只能做文件级粗筛**
+ *
+ * ⚠️ **两档的用途不对称，混用会出事。** 粗筛档只配拿去记知识债和做展示；
+ * 正面证据（`human_wrote` / `debugged`）**只认精确档**。
+ * 理由是代价不对称：把没学过的算成学过，比漏记一次严重得多 ——
+ * 改了一个 Redis 文件就给你记上"Redis 集群"的学习证据，那个分数是假的。
+ * 而记债的方向相反：不确定时多记一笔债只会拉低置信度，不会虚高掌握度。
  */
 export function matchKnowledge(input: {
   project: StoredProject;
@@ -167,7 +180,7 @@ export function matchKnowledge(input: {
   nodes: readonly StoredNode[];
   files: readonly string[];
   diff: string;
-}): { techIds: string[]; nodeGroupIds: string[] } {
+}): { techIds: string[]; exactNodeGroupIds: string[]; coarseNodeGroupIds: string[] } {
   const changed = new Set(input.files);
   const techIds = new Set<string>();
 
@@ -186,27 +199,29 @@ export function matchKnowledge(input: {
     }
   }
 
-  const nodeGroupIds = new Set<string>();
+  const exact = new Set<string>();
+  const coarse = new Set<string>();
   for (const node of input.nodes) {
     if (!techIds.has(node.techId)) continue;
-    // FQN-exact：符号必须整词出现在 diff 里
+    // 技术命中了，它下面的知识点都是**粗筛**候选
+    coarse.add(node.groupId);
+    // FQN-exact：符号必须整词出现在 diff 里。
+    // 边界两侧都用 `[^A-Za-z0-9_]` —— `.` 是合法边界，否则 `client.EXPIRE(...)`
+    // 这种方法调用形态整个匹配不上，而那是符号最常见的出现方式。
+    // 同时 `EXPIREDAT` / `MY_EXPIRE` 仍然不算命中。
     const hit = node.symbols.some((symbol) => {
       if (symbol.length < 3) return false;
       const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return new RegExp(`(?:^|[^A-Za-z0-9_.])${escaped}(?:[^A-Za-z0-9_]|$)`).test(input.diff);
+      return new RegExp(`(?:^|[^A-Za-z0-9_])${escaped}(?:[^A-Za-z0-9_]|$)`).test(input.diff);
     });
-    if (hit) nodeGroupIds.add(node.groupId);
+    if (hit) exact.add(node.groupId);
   }
 
-  // 一个技术命中了但它下面没有任何符号命中：退回技术级，取该技术全部知识点做粗筛。
-  // 这**只**用于"这次 commit 大概涉及哪些方面"的展示，不用于链路判定。
-  if (nodeGroupIds.size === 0) {
-    for (const node of input.nodes) {
-      if (techIds.has(node.techId)) nodeGroupIds.add(node.groupId);
-    }
-  }
-
-  return { techIds: [...techIds], nodeGroupIds: [...nodeGroupIds] };
+  return {
+    techIds: [...techIds],
+    exactNodeGroupIds: [...exact],
+    coarseNodeGroupIds: [...coarse],
+  };
 }
 
 export interface AnalyzeResult {
@@ -267,7 +282,7 @@ export async function analyzeCommits(input: {
       diff,
     });
 
-    const unGrasped = matched.nodeGroupIds.filter((groupId) => !input.grasped.has(groupId));
+    const unGrasped = matched.coarseNodeGroupIds.filter((groupId) => !input.grasped.has(groupId));
     const isAgent = attribution.authorship === "agent" || attribution.authorship === "mixed";
 
     insights.push({
@@ -283,14 +298,18 @@ export async function analyzeCommits(input: {
       touchedTechs: matched.techIds
         .map((techId) => input.techs.get(techId)?.name)
         .filter((name): name is string => Boolean(name)),
-      touchedNodeGroupIds: matched.nodeGroupIds,
+      touchedNodeGroupIds: matched.coarseNodeGroupIds,
       knowledgeDebt: isAgent ? unGrasped.length : 0,
     });
 
     // ④ 落证据。`unknown` 一条都不产生 —— 宁可少记，不能瞎记
     const kind = evidenceKindFor(attribution, isFixCommit(commit.subject));
     if (!kind) continue;
-    for (const groupId of matched.nodeGroupIds) {
+    // ⭐ 记债可以走粗筛，涨分只认精确匹配。见 matchKnowledge 的文档注释
+    const targets = kind === "agent_wrote_unreviewed"
+      ? matched.coarseNodeGroupIds
+      : matched.exactNodeGroupIds;
+    for (const groupId of targets) {
       if (!nodesByGroup.has(groupId)) continue;
       const reference = `commit:${commit.sha}`;
       evidence.push({

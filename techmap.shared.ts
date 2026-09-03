@@ -253,20 +253,30 @@ export interface TechResolution {
   readonly worthLearning: boolean;
   /** 来自内置表还是 agent 学的。UI 上不区分，排障时区分。 */
   readonly source: "builtin" | "learned";
+  /**
+   * 这个包名有多"像"这个技术本身，0 最像。
+   *
+   * ⚠️ 这个字段不是装饰。多个包并到同一个 TechEntity 时，**版本号必须取最规范的
+   * 那个包的**。实机踩到过：`tsx@^4.20.6` 和 `typescript@^5.9.3` 都归到
+   * `tech:typescript`，取数组第一个的结果是界面上显示 `TypeScript@^4.20.6` ——
+   * 一个不存在的版本号，而用户没法知道它是从哪来的。
+   */
+  readonly aliasRank: number;
 }
 
-const EXACT = new Map<string, TechDef>();
-const PREFIXES: Array<{ prefix: string; def: TechDef }> = [];
+const EXACT = new Map<string, { def: TechDef; rank: number }>();
+const PREFIXES: Array<{ prefix: string; def: TechDef; rank: number }> = [];
 for (const definition of TECH_DEFS) {
-  for (const alias of definition.aliases) {
+  definition.aliases.forEach((alias, rank) => {
     const key = alias.toLowerCase();
-    EXACT.set(key, definition);
-    // `@scope` 和 `com.example` 这类是命名空间，按前缀吃掉整个命名空间
+    if (!EXACT.has(key)) EXACT.set(key, { def: definition, rank });
+    // `@scope` 和 `com.example` 这类是命名空间，按前缀吃掉整个命名空间。
+    // 前缀命中排在所有精确命中之后 —— `@types/react` 不该比 `react` 更权威
     if (key.startsWith("@") || key.includes(".") || key.includes("/")) {
-      PREFIXES.push({ prefix: `${key}/`, def: definition });
-      if (key.includes(".")) PREFIXES.push({ prefix: `${key}.`, def: definition });
+      PREFIXES.push({ prefix: `${key}/`, def: definition, rank: rank + 100 });
+      if (key.includes(".")) PREFIXES.push({ prefix: `${key}.`, def: definition, rank: rank + 100 });
     }
-  }
+  });
 }
 // 长前缀优先，否则 `@types/react` 会被 `@types` 之类的短前缀先吃掉
 PREFIXES.sort((left, right) => right.prefix.length - left.prefix.length);
@@ -292,19 +302,22 @@ export function resolveTech(
       category: fromLearned.category,
       worthLearning: fromLearned.worthLearning,
       source: "learned",
+      // agent 是针对这个具体的包判过一次的，比内置表的猜测更贴
+      aliasRank: 0,
     };
   }
   const exact = EXACT.get(key);
   if (exact) {
     return {
-      techId: exact.id,
-      name: exact.name,
-      category: exact.category,
-      worthLearning: exact.worthLearning,
+      techId: exact.def.id,
+      name: exact.def.name,
+      category: exact.def.category,
+      worthLearning: exact.def.worthLearning,
       source: "builtin",
+      aliasRank: exact.rank,
     };
   }
-  for (const { prefix, def: definition } of PREFIXES) {
+  for (const { prefix, def: definition, rank } of PREFIXES) {
     if (key.startsWith(prefix)) {
       return {
         techId: definition.id,
@@ -312,6 +325,7 @@ export function resolveTech(
         category: definition.category,
         worthLearning: definition.worthLearning,
         source: "builtin",
+        aliasRank: rank,
       };
     }
   }

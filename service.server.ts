@@ -13,7 +13,7 @@ import {
   resolveProvider,
 } from "./agentrun.server";
 import { collapse, identityColor, type StatusBucket } from "./buckets.shared";
-import { analyzeCommits, type CommitInsight } from "./commits.server";
+import { analyzeCommits, headSha, type CommitInsight } from "./commits.server";
 import { classifyPending } from "./classify.server";
 import type {
   agentImpactRpc,
@@ -448,7 +448,6 @@ async function ingestLiveAgents(
   context: PluginHandlerContext,
   project: StoredProject,
   workspaceId: string,
-  lang: Locale,
 ): Promise<Dashboard["liveAgents"]> {
   let page;
   try {
@@ -539,7 +538,7 @@ async function dashboardFor(
   project: StoredProject,
   input: WorkspaceInput,
 ): Promise<Dashboard> {
-  const liveAgents = await ingestLiveAgents(context, project, input.workspaceId, "en").catch(() => []);
+  const liveAgents = await ingestLiveAgents(context, project, input.workspaceId).catch(() => []);
   const state = await readState();
   const lang = localeOf(state, input);
   const now = Date.now();
@@ -578,6 +577,19 @@ async function dashboardFor(
   };
 }
 
+/**
+ * commit 分析的结果缓存。
+ *
+ * dashboard 面板每 45 秒轮询一次，而一次分析要为每个 commit 跑一次 `git show`
+ * 拿 diff —— 实测一个中等仓库 1.7 秒、40 个 git 子进程。**HEAD 没动的时候
+ * 结果不可能变**，所以按 `(项目, HEAD, 条数)` 缓存住。
+ *
+ * 掌握度会随证据变化，但那只影响 `knowledgeDebt` 的计数；
+ * 拿到新证据的路径（还债、检验题）都会自己触发 dashboard 重取，
+ * 那时 HEAD 一般也没变，所以这里额外挂一个证据条数做失效判据。
+ */
+const commitCache = new Map<string, { key: string; insights: CommitInsight[] }>();
+
 /** 跑一次 commit 分析并把新证据落库（幂等）。 */
 async function analyzeAndRecord(
   project: StoredProject,
@@ -585,6 +597,10 @@ async function analyzeAndRecord(
   limit: number,
 ): Promise<CommitInsight[]> {
   if (!project.isGit) return [];
+  const head = await headSha(project.root);
+  const cacheKey = `${head ?? "-"}|${limit}|${state.evidence.length}|${state.nodes.length}`;
+  const cached = commitCache.get(project.id);
+  if (cached?.key === cacheKey) return cached.insights;
   const now = Date.now();
   const result = await analyzeCommits({
     project,
@@ -605,7 +621,13 @@ async function analyzeAndRecord(
       }
     });
   }
+  commitCache.set(project.id, { key: cacheKey, insights: result.insights });
   return result.insights;
+}
+
+/** 测试要能把缓存清掉，否则跨用例互相污染。 */
+export function resetCommitCacheForTests(): void {
+  commitCache.clear();
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -1006,7 +1028,7 @@ export async function listReviews(
 ) {
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
-  await ingestLiveAgents(context, project, input.workspaceId, "en").catch(() => []);
+  await ingestLiveAgents(context, project, input.workspaceId).catch(() => []);
   const state = await readState();
   const now = Date.now();
   return {

@@ -331,6 +331,10 @@ const CATALOG = {
     zh: `${verdict} · 得分 ${percent}%`,
     en: `${verdict} · scored ${percent}%`,
   }),
+  quiz_graded_locally: {
+    zh: "这次是本地关键词判分，比 agent 判分弱得多 —— 通过了也别太当真",
+    en: "Graded locally by keyword coverage, which is much weaker than agent grading; treat a pass with caution",
+  },
 
   // ── 提交 ────────────────────────────────────────────────────────
   commits_title: { zh: "提交时间线", en: "Commit timeline" },

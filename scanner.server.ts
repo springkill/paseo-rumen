@@ -17,10 +17,10 @@
 
 import { execFile } from "node:child_process";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
-import { basename, extname, join, parse as parsePath, relative, resolve, sep } from "node:path";
+import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { confidenceForLayers, projectIdentity } from "./domain.shared";
+import { forbiddenRoot } from "./roots.server";
 import type { StoredAnchor, StoredProjectTech, StoredTechEntity } from "./store.server";
 import {
   learnedKey,
@@ -71,20 +71,6 @@ export class ScanBoundaryError extends Error {
     super(`Refusing to scan ${path} (${reason})`);
     this.name = "ScanBoundaryError";
   }
-}
-
-/**
- * 这个目录能不能当项目扫。
- *
- * 家目录和文件系统根**永远不扫** —— 它们不是项目，扫出来的东西对谁都没有意义。
- */
-function forbiddenRoot(path: string): boolean {
-  const canonical = path.replace(/\/+$/, "") || "/";
-  if (canonical === parsePath(canonical).root) return true;
-  const home = homedir().replace(/\/+$/, "");
-  if (canonical === home) return true;
-  return ["/home", "/Users", "/root", "/tmp", "/var", "/usr", "/etc", "/opt", "/mnt", "/srv"]
-    .includes(canonical);
 }
 
 function anchor(file: string, line: number, snippet: string, layer: StoredAnchor["layer"]): StoredAnchor {
@@ -360,7 +346,12 @@ export async function scanWorkspace(
 
   // ── 归并：Package → TechEntity ─────────────────────────────────
   const techs = new Map<string, StoredTechEntity>();
-  const usage = new Map<string, { versions: string[]; findings: Finding[]; packages: Set<string> }>();
+  const usage = new Map<string, {
+    /** 版本候选，按"这个包有多像这个技术本身"排序后取第一个。 */
+    versions: Array<{ version: string; rank: number }>;
+    findings: Finding[];
+    packages: Set<string>;
+  }>();
   const pending = new Map<string, { pkg: string; ecosystem: string; version: string | null; occurrences: number }>();
 
   for (const finding of findings) {
@@ -385,7 +376,11 @@ export async function scanWorkspace(
     const entry = usage.get(resolved.techId) ?? { versions: [], findings: [], packages: new Set<string>() };
     entry.findings.push(finding);
     entry.packages.add(finding.pkg);
-    if (finding.version && !entry.versions.includes(finding.version)) entry.versions.push(finding.version);
+    if (finding.version) {
+      // ⭐ 带上 alias 规范度，下面按它排序。直接取先出现的那个会显示出
+      // `TypeScript@^4.20.6` 这种根本不存在的版本（那是 tsx 的版本号）
+      entry.versions.push({ version: finding.version, rank: resolved.aliasRank });
+    }
     usage.set(resolved.techId, entry);
   }
 
@@ -394,9 +389,12 @@ export async function scanWorkspace(
     const layers = new Set(entry.findings.map((item) => item.anchor.layer));
     const maxConfidence = Math.max(...entry.findings.map((item) => item.confidence));
     const evidence = [...new Map(entry.findings.map((item) => [`${item.anchor.file}:${item.anchor.line}`, item.anchor])).values()].slice(0, 20);
+    const version = entry.versions
+      .slice()
+      .sort((left, right) => left.rank - right.rank)[0]?.version ?? null;
     technologies.push({
       techId,
-      version: entry.versions[0] ?? null,
+      version,
       confidence: Math.round(confidenceForLayers(maxConfidence, layers.size) * 100) / 100,
       evidence,
       packages: [...entry.packages].slice(0, 20),

@@ -424,7 +424,7 @@ function QuizBox({ tech, workspaceId, cwd, clientLocale, theme, t, codeQuizAllow
   const nextQuiz = useRpc(quizNextRpc);
   const answerQuiz = useRpc(quizAnswerRpc);
   const [answer, setAnswer] = useState("");
-  const [result, setResult] = useState<{ passed: boolean; text: string } | null>(null);
+  const [result, setResult] = useState<{ passed: boolean; text: string; local: boolean } | null>(null);
 
   const question = useQuery({
     queryKey: ["rumen", "quiz", workspaceId, tech.id],
@@ -437,6 +437,7 @@ function QuizBox({ tech, workspaceId, cwd, clientLocale, theme, t, codeQuizAllow
     onSuccess(value) {
       setResult({
         passed: value.passed,
+        local: value.gradedLocally,
         text: `${t.quiz_result(value.passed ? t.quiz_passed : t.quiz_failed, Math.round(value.score * 100))}${
           value.feedback ? `\n\n${value.feedback}` : ""
         }`,
@@ -497,9 +498,15 @@ function QuizBox({ tech, workspaceId, cwd, clientLocale, theme, t, codeQuizAllow
             {submit.error ? <ErrorCard error={submit.error} theme={theme} t={t} /> : null}
             {result
               ? (
-                <Text style={{ color: result.passed ? theme.colors.statusSuccess : theme.colors.statusWarning, lineHeight: 20 }}>
-                  {result.text}
-                </Text>
+                <View style={{ gap: 5 }}>
+                  <Text style={{ color: result.passed ? theme.colors.statusSuccess : theme.colors.statusWarning, lineHeight: 20 }}>
+                    {result.text}
+                  </Text>
+                  {/* 降级判分必须明说 —— 静默降级会让用户高估这次通过的含金量 */}
+                  {result.local
+                    ? <Text style={{ color: theme.colors.foregroundMuted, fontSize: 11, lineHeight: 16 }}>{t.quiz_graded_locally}</Text>
+                    : null}
+                </View>
               )
               : null}
           </Card>
