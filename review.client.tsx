@@ -20,13 +20,13 @@ import {
   markReviewedRpc,
   reviewSourceRpc,
   type ReviewItem,
+  type RumenTarget,
 } from "./contracts.shared";
 import { relativeTime, type Translator } from "./i18n.shared";
 import { Button, Card, Empty, MasteryBar, Mono, Pill, Row, Section } from "./ui.client";
 
-function SourceView({ workspaceId, cwd, clientLocale, reviewId, theme, t }: {
-  workspaceId: string;
-  cwd: string;
+function SourceView({ target, clientLocale, reviewId, theme, t }: {
+  target: RumenTarget;
   clientLocale: string | undefined;
   reviewId: string;
   theme: PluginTheme;
@@ -34,8 +34,8 @@ function SourceView({ workspaceId, cwd, clientLocale, reviewId, theme, t }: {
 }) {
   const getSource = useRpc(reviewSourceRpc);
   const query = useQuery({
-    queryKey: ["rumen", "review-source", workspaceId, reviewId],
-    queryFn: () => getSource({ workspaceId, cwd, clientLocale, reviewId }),
+    queryKey: ["rumen", "review-source", reviewId],
+    queryFn: () => getSource({ ...target, clientLocale, reviewId }),
     retry: 0,
     staleTime: 30_000,
   });
@@ -65,10 +65,9 @@ function SourceView({ workspaceId, cwd, clientLocale, reviewId, theme, t }: {
   );
 }
 
-function ReviewCard({ review, workspaceId, cwd, clientLocale, theme, t, now, onMark, marking }: {
+function ReviewCard({ review, target, clientLocale, theme, t, now, onMark, marking }: {
   review: ReviewItem;
-  workspaceId: string;
-  cwd: string;
+  target: RumenTarget;
   clientLocale: string | undefined;
   theme: PluginTheme;
   t: Translator;
@@ -138,8 +137,7 @@ function ReviewCard({ review, workspaceId, cwd, clientLocale, theme, t, now, onM
 
       {open ? (
         <SourceView
-          workspaceId={workspaceId}
-          cwd={cwd}
+          target={target}
           clientLocale={clientLocale}
           reviewId={review.id}
           theme={theme}
@@ -150,10 +148,9 @@ function ReviewCard({ review, workspaceId, cwd, clientLocale, theme, t, now, onM
   );
 }
 
-export function ReviewView({ reviews, workspaceId, cwd, clientLocale, theme, t, onChanged }: {
+export function ReviewView({ reviews, target, clientLocale, theme, t, onChanged }: {
   reviews: ReviewItem[];
-  workspaceId: string;
-  cwd: string;
+  target: RumenTarget;
   clientLocale: string | undefined;
   theme: PluginTheme;
   t: Translator;
@@ -165,7 +162,7 @@ export function ReviewView({ reviews, workspaceId, cwd, clientLocale, theme, t, 
   const now = Date.now();
 
   const mark = useMutation({
-    mutationFn: (reviewId: string) => markDone({ workspaceId, cwd, clientLocale, reviewId }),
+    mutationFn: (reviewId: string) => markDone({ ...target, clientLocale, reviewId }),
     onSuccess() {
       toast.show(t.review_marked, { variant: "success" });
       void queryClient.invalidateQueries({ queryKey: ["rumen"] });
@@ -189,8 +186,7 @@ export function ReviewView({ reviews, workspaceId, cwd, clientLocale, theme, t, 
             <ReviewCard
               key={review.id}
               review={review}
-              workspaceId={workspaceId}
-              cwd={cwd}
+              target={target}
               clientLocale={clientLocale}
               theme={theme}
               t={t}

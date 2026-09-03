@@ -240,9 +240,20 @@ const LocaleInput = z.object({
   clientLocale: z.string().max(35).optional(),
 });
 
+/**
+ * 目标项目的两种寻址方式。
+ *
+ * - `workspaceId + cwd`：从 workspace 面板来。会校验目录确实是这个 Paseo
+ *   workspace 的，并且允许扫描（首次绑定就走这条）。
+ * - `projectId`：从全局 Rumen 界面来。项目根在绑定时已经校验过了，
+ *   这里直接用存下来的那个 —— 全局界面上并不存在"当前 workspace"这个东西。
+ *
+ * 两个都不给会被服务端拒掉。
+ */
 const WorkspaceInput = LocaleInput.extend({
-  workspaceId: z.string().min(1).max(256),
-  cwd: z.string().min(1).max(4096),
+  workspaceId: z.string().min(1).max(256).optional(),
+  cwd: z.string().min(1).max(4096).optional(),
+  projectId: z.string().min(1).max(512).optional(),
 });
 
 const TechInput = WorkspaceInput.extend({ techId: z.string().min(1).max(512) });
@@ -427,3 +438,8 @@ export type QuizResult = z.output<typeof QuizResultSchema>;
 export type Settings = z.output<typeof SettingsSchema>;
 export type TimelineImpact = z.output<typeof TimelineImpactSchema>;
 export type PendingPackageView = z.output<typeof PendingPackageSchema>;
+
+/** 客户端拼 RPC 入参用。两种寻址方式二选一，类型上就不允许混着传。 */
+export type RumenTarget =
+  | { workspaceId: string; cwd: string; projectId?: never }
+  | { projectId: string; workspaceId?: never; cwd?: never };

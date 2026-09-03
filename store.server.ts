@@ -12,7 +12,7 @@
 
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { EvidenceKind, Privacy } from "./domain.shared";
 import type { Locale } from "./i18n.shared";
 import { forbiddenRoot } from "./roots.server";
@@ -194,7 +194,7 @@ export interface StoredSettings {
 }
 
 export interface RumenState {
-  version: 2;
+  version: 3;
   settings: StoredSettings;
   projects: StoredProject[];
   /** 全局 TechEntity 注册表。 */
@@ -215,7 +215,7 @@ export const DEFAULT_SETTINGS: StoredSettings = {
 };
 
 const EMPTY: RumenState = {
-  version: 2,
+  version: 3,
   settings: DEFAULT_SETTINGS,
   projects: [],
   techs: [],
@@ -287,14 +287,30 @@ function migrateV1(value: Record<string, unknown>): RumenState {
   return { ...structuredClone(EMPTY), projects };
 }
 
-function normalize(value: unknown): RumenState | { migrateFrom: 1; state: RumenState } {
+/**
+ * v2 → v3：把项目名重算一遍。
+ *
+ * ⚠️ v2 把 workspace 的 `title` 当成了项目名，而那是 agent 从对话内容生成的
+ * **会话标题** —— 项目列表因此显示成 "Verify engine migration and experimental
+ * context"、"Explore naruto codebase" 这种东西。术语表里 `Project` 是
+ * 「绑定的仓库」，仓库不会因为你跟 agent 聊了什么就改名。
+ *
+ * 重置成目录名。下次从 workspace 面板打开时会用 Paseo 自己的 `projectDisplayName`
+ * 再刷新一次。
+ */
+function migrateV2(state: RumenState): RumenState {
+  for (const project of state.projects) project.name = basename(project.root) || project.root;
+  return state;
+}
+
+function normalize(value: unknown): RumenState | { migrateFrom: 1 | 2; state: RumenState } {
   if (!value || typeof value !== "object") return structuredClone(EMPTY);
   const candidate = value as Record<string, unknown>;
   if (candidate.version === 1) return { migrateFrom: 1, state: migrateV1(candidate) };
-  if (candidate.version !== 2) return structuredClone(EMPTY);
+  if (candidate.version !== 2 && candidate.version !== 3) return structuredClone(EMPTY);
   const settings = (candidate.settings ?? {}) as Partial<StoredSettings>;
-  return {
-    version: 2,
+  const parsed: RumenState = {
+    version: 3,
     settings: {
       locale: settings.locale === "zh" || settings.locale === "en" ? settings.locale : "auto",
       provider: typeof settings.provider === "string" ? settings.provider : null,
@@ -310,6 +326,7 @@ function normalize(value: unknown): RumenState | { migrateFrom: 1; state: RumenS
     observations: list<StoredObservation>(candidate.observations),
     reviews: list<StoredReview>(candidate.reviews),
   };
+  return candidate.version === 2 ? { migrateFrom: 2, state: migrateV2(parsed) } : parsed;
 }
 
 async function loadUnqueued(): Promise<RumenState> {
@@ -337,15 +354,18 @@ async function loadUnqueued(): Promise<RumenState> {
   }
   const result = normalize(parsed);
   if ("migrateFrom" in result) {
-    const backup = `${path}.v1-${Date.now()}`;
+    const from = result.migrateFrom;
+    const backup = `${path}.v${from}-${Date.now()}`;
     await writeFile(backup, raw, { encoding: "utf8", mode: 0o600 }).catch(() => {});
     cached = result.state;
     // ⚠️ 迁移必须**立刻落盘**，不能只改内存。
-    // 只改内存的话磁盘上仍是 v1，下次加载又迁移一遍 —— 每次 reload 多留一份
+    // 只改内存的话磁盘上仍是旧版本，下次加载又迁移一遍 —— 每次 reload 多留一份
     // 全量备份。实机上两次 reload 就把这个目录从 7.8MB 堆到 23MB。
     await persist(result.state);
     console.warn(
-      `[rumen] migrated state v1 → v2. v1's technology and concept data came from a scanner that turned every package into its own technology, so it was dropped; projects and privacy levels were kept. The original file is at ${backup}. Re-scan each workspace to rebuild.`,
+      from === 1
+        ? `[rumen] migrated state v1 → v3. v1's technology and concept data came from a scanner that turned every package into its own technology, so it was dropped; projects and privacy levels were kept. The original file is at ${backup}. Re-scan each workspace to rebuild.`
+        : `[rumen] migrated state v2 → v3: project names were rebuilt from directory names. v2 stored the workspace session title instead, so the project list showed agent conversation titles. The original file is at ${backup}.`,
     );
     return cached;
   }

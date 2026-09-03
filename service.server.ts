@@ -87,7 +87,11 @@ import {
 import { learnedKey } from "./techmap.shared";
 
 type LocaleInput = { clientLocale?: string };
-type WorkspaceInput = LocaleInput & { workspaceId: string; cwd: string };
+type WorkspaceInput = LocaleInput & {
+  workspaceId?: string;
+  cwd?: string;
+  projectId?: string;
+};
 
 // ── 语言 ────────────────────────────────────────────────────────────
 
@@ -106,7 +110,7 @@ async function tFor(input: LocaleInput): Promise<Translator> {
 // ── workspace 校验 ──────────────────────────────────────────────────
 
 async function validateWorkspace(
-  input: WorkspaceInput,
+  input: WorkspaceInput & { workspaceId: string; cwd: string },
   context: PluginHandlerContext,
   t: Translator,
 ): Promise<{ root: string; isGit: boolean; name: string }> {
@@ -118,7 +122,25 @@ async function validateWorkspace(
   const supplied = await resolveProjectRoot(input.cwd);
   const actual = await resolveProjectRoot(snapshot.workspaceDirectory);
   if (supplied.root !== actual.root) throw new Error(t.err_workspace_mismatch);
-  return { ...actual, name: snapshot.title ?? snapshot.name ?? basename(actual.root) };
+  return { ...actual, name: projectNameFrom(snapshot, actual.root) };
+}
+
+/**
+ * 项目叫什么。
+ *
+ * ⚠️ **不能用 `snapshot.title`。** 那是 workspace 的**会话标题**，由 agent
+ * 从对话内容生成 —— 实机上项目列表因此显示成
+ * "Investigate flaky checkout tests"、"Explore naruto codebase"
+ * 这种东西。术语表里 `Project` 是「绑定的仓库」，仓库不会因为你跟 agent 聊了什么改名。
+ *
+ * `projectDisplayName` 才是 Paseo 自己的项目名；取不到就退回目录名。
+ */
+function projectNameFrom(snapshot: unknown, root: string): string {
+  const value = snapshot as { projectDisplayName?: unknown; projectCustomName?: unknown };
+  const custom = typeof value.projectCustomName === "string" ? value.projectCustomName.trim() : "";
+  if (custom) return custom;
+  const display = typeof value.projectDisplayName === "string" ? value.projectDisplayName.trim() : "";
+  return display || basename(root);
 }
 
 function identityKind(id: string): "git" | "root" | "path" {
@@ -186,7 +208,24 @@ async function ensureProject(
   t: Translator,
   options: { scan?: boolean } = {},
 ): Promise<StoredProject> {
-  const workspace = await validateWorkspace(input, context, t);
+  // 全局 Rumen 界面上没有"当前 workspace"，只能按项目 id 寻址。
+  // 项目根在绑定时已经校验过，这里直接用存下来的那个
+  if (!input.workspaceId || !input.cwd) {
+    // 两种寻址都没给：这是调用方的问题，不是"workspace 不可用"。
+    // 说错话的错误消息比没有错误消息更费时间
+    if (!input.projectId) throw new Error(t.err_project_unknown);
+    const state = await readState();
+    const stored = state.projects.find((item) => item.id === input.projectId);
+    if (!stored) throw new Error(t.err_project_unknown);
+    if (!options.scan) return structuredClone(stored);
+    return rescan(stored, t, input);
+  }
+
+  const workspace = await validateWorkspace(
+    input as WorkspaceInput & { workspaceId: string; cwd: string },
+    context,
+    t,
+  );
   const identity = await identifyProject(workspace.root);
   const state = await readState();
   const needsScan = options.scan
@@ -208,8 +247,9 @@ async function ensureProject(
     }
   }
 
+  const workspaceId = input.workspaceId;
   return updateState((current) => {
-    const project = bindProject(current, identity, workspace, input.workspaceId);
+    const project = bindProject(current, identity, workspace, workspaceId);
     if (scanned) {
       project.technologies = scanned.technologies;
       project.pending = scanned.pending;
@@ -223,6 +263,44 @@ async function ensureProject(
       }
       ensureFallbackNodes(current, project, localeOf(current, input));
     }
+    return structuredClone(project);
+  });
+}
+
+/** 按项目 id 重扫。用在全局界面上 —— 那里没有 workspace 可校验。 */
+async function rescan(
+  stored: StoredProject,
+  t: Translator,
+  input: LocaleInput,
+): Promise<StoredProject> {
+  const state = await readState();
+  let scanned;
+  try {
+    scanned = await scanWorkspace(stored.root, stored.isGit, state.aliases);
+  } catch (error) {
+    if (error instanceof ScanBoundaryError) {
+      throw new Error(
+        error.reason === "home_or_root"
+          ? t.err_scan_home_directory(error.path)
+          : t.err_scan_too_broad(error.fileCount, error.path),
+      );
+    }
+    throw error;
+  }
+  return updateState((current) => {
+    const project = current.projects.find((item) => item.id === stored.id);
+    if (!project) throw new Error(t.err_project_unknown);
+    project.technologies = scanned.technologies;
+    project.pending = scanned.pending;
+    project.truncated = scanned.truncated;
+    project.lastScanAt = Date.now();
+    const known = new Set(current.techs.map((item) => item.id));
+    for (const tech of scanned.techs) {
+      if (known.has(tech.id)) continue;
+      current.techs.push(tech);
+      known.add(tech.id);
+    }
+    ensureFallbackNodes(current, project, localeOf(current, input));
     return structuredClone(project);
   });
 }
@@ -443,12 +521,20 @@ function agentBucket(status: string | null, requiresAttention: boolean, candidat
   return "done";
 }
 
-/** 把这个项目下所有活着的 agent 的改动摄取进来。 */
+/**
+ * 把这个项目下所有活着的 agent 的改动摄取进来。
+ *
+ * `workspaceId` 给了就只看那一个（workspace 面板的场景）；没给就看这个项目
+ * 关联过的**全部** workspace —— 全局界面上不存在"当前 workspace"，
+ * 但项目底下可能同时有好几个 workspace 在跑 agent，一个都不该漏。
+ */
 async function ingestLiveAgents(
   context: PluginHandlerContext,
   project: StoredProject,
-  workspaceId: string,
+  workspaceId: string | undefined,
 ): Promise<Dashboard["liveAgents"]> {
+  const accepted = new Set(workspaceId ? [workspaceId] : project.workspaceIds);
+  if (accepted.size === 0) return [];
   let page;
   try {
     page = await context.paseo.agents.list({ scope: "active", page: { limit: 50 } });
@@ -465,7 +551,7 @@ async function ingestLiveAgents(
   const live: Dashboard["liveAgents"] = [];
   for (const entry of page.entries) {
     const agent = entry.agent;
-    if (!agent?.id || agent.workspaceId !== workspaceId) continue;
+    if (!agent?.id || !agent.workspaceId || !accepted.has(agent.workspaceId)) continue;
     // 我们自己起的生成会话不算用户的 agent
     if (agent.labels?.["rumen.task"]) continue;
     const agentId = agent.id;

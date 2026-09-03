@@ -122,8 +122,7 @@ export function RumenAgentPanel({ theme, host, layout, workspaceId, agentId }: P
               {/* 就地还债：不用切到 workspace 面板去 */}
               <ReviewView
                 reviews={data.reviews}
-                workspaceId={workspaceId}
-                cwd={cwd}
+                target={{ workspaceId, cwd }}
                 clientLocale={clientLocale}
                 theme={theme}
                 t={t}

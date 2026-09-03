@@ -415,6 +415,71 @@ test("掌握度是全局的：A 项目学会，B 项目打开就是已掌握", a
   });
 });
 
+test("全局界面按 projectId 寻址 —— 那里没有\"当前 workspace\"", async () => {
+  await withStore(async () => {
+    const root = await mkdtemp(join(tmpdir(), "paseo-rumen-byid-"));
+    try {
+      await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: { react: "^19.0.0" } }));
+      const context = contextFor("workspace-1", root);
+
+      // 先从 workspace 面板绑定一次
+      const bound = await getDashboard({ workspaceId: "workspace-1", cwd: root }, context);
+      const projectId = bound.project.id;
+
+      // 再从全局界面按 id 打开：拿到同一个项目，不需要 workspace
+      const byId = await getDashboard({ projectId }, context);
+      assert.equal(byId.project.id, projectId);
+      assert.equal(byId.project.root, root);
+      assert.ok(byId.technologies.some((item) => item.id === "tech:react"));
+
+      // 记证据也走同一条路
+      const node = byId.technologies.find((item) => item.id === "tech:react")!.nodes[0]!;
+      const mastery = await recordEvidence(
+        { projectId, nodeGroupId: node.groupId, kind: "wiki_read" },
+        context,
+      );
+      assert.ok(mastery.score > 0);
+
+      // 两个都不给要被拒
+      await assert.rejects(() => getDashboard({}, context), /找不到这个项目|Unknown project/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+test("项目名不能是 workspace 的会话标题", async () => {
+  await withStore(async () => {
+    const root = await mkdtemp(join(tmpdir(), "paseo-rumen-name-"));
+    try {
+      await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: { react: "^19.0.0" } }));
+      // Paseo 的 workspace 快照里 title 是 agent 从对话生成的会话标题
+      const context = {
+        paseo: {
+          workspaces: {
+            ref: () => ({
+              refresh: async () => ({
+                id: "workspace-1",
+                workspaceDirectory: root,
+                title: "Explore naruto codebase",
+                name: "some-worktree-slug",
+                projectDisplayName: "acme-billing",
+              }),
+            }),
+          },
+          agents: { list: async () => ({ entries: [] }), ref: () => ({ timeline: { refetch: async () => ({ agent: null, entries: [] }) } }) },
+          providers: { snapshot: async () => ({ entries: [] }) },
+        },
+      } as unknown as PluginHandlerContext;
+
+      const dashboard = await getDashboard({ workspaceId: "workspace-1", cwd: root }, context);
+      assert.equal(dashboard.project.name, "acme-billing", "要用 projectDisplayName，不是会话标题");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── 语言 ────────────────────────────────────────────────────────────
 
 test("设置里的语言压过环境，且服务端错误跟着走", async () => {
@@ -495,7 +560,7 @@ test("v1 迁移保留项目身份，丢弃坏掉的技术栈数据，并留下�
     await writeFile(statePath(), JSON.stringify(v1), "utf8");
 
     const state = await readState();
-    assert.equal(state.version, 2);
+    assert.equal(state.version, 3);
     assert.equal(state.projects.length, 1, "家目录那条事故产物被丢掉了");
     assert.equal(state.projects[0]?.id, "git:github.com/acme/repo", "项目身份要留住");
     assert.equal(state.projects[0]?.privacy, "public", "隐私级别是用户设的，要留住");
@@ -529,7 +594,45 @@ test("迁移只发生一次 —— 立刻落盘，不是只改内存", async () 
     const backups = (await readdir(data)).filter((name) => name.includes(".v1-"));
     assert.equal(backups.length, 1, "只改内存的话每次 reload 都会重新迁移并再留一份全量备份");
     const onDisk = JSON.parse(await readFile(statePath(), "utf8"));
-    assert.equal(onDisk.version, 2, "磁盘上必须已经是 v2");
+    assert.equal(onDisk.version, 3, "磁盘上必须已经是最新版本");
+  });
+});
+
+test("v2 → v3 把项目名从会话标题改回目录名", async () => {
+  await withStore(async (data) => {
+    await mkdir(data, { recursive: true });
+    await writeFile(
+      statePath(),
+      JSON.stringify({
+        version: 2,
+        settings: { locale: "auto", provider: null, deferToUserAgents: true },
+        projects: [{
+          id: "git:github.com/acme/billing-api",
+          workspaceIds: ["w1"],
+          // v2 存的是 workspace 的会话标题 —— agent 从对话内容生成的
+          name: "Investigate flaky checkout tests",
+          root: "/home/alice/work/billing-api",
+          privacy: "private",
+          isGit: true,
+          lastScanAt: 123,
+          truncated: false,
+          technologies: [],
+          pending: [],
+          lastAnalyzedSha: null,
+        }],
+        techs: [], nodes: [], evidence: [], wikis: [], questions: [],
+        aliases: [], observations: [], reviews: [],
+      }),
+      "utf8",
+    );
+
+    const state = await readState();
+    assert.equal(state.version, 3);
+    assert.equal(state.projects[0]?.name, "billing-api", "项目是仓库，不会因为你跟 agent 聊了什么改名");
+    assert.equal(state.projects[0]?.lastScanAt, 123, "v2 的扫描结果是好的，不该丢");
+
+    const { readdir } = await import("node:fs/promises");
+    assert.ok((await readdir(data)).some((name) => name.includes(".v2-")), "留一份 v2 备份");
   });
 });
 

@@ -221,6 +221,16 @@ const CATALOG = {
   },
   stack_detected: (n: number) => ({ zh: `检出 ${n} 个`, en: `${n} detected` }),
   stack_back: { zh: "返回技术栈", en: "Back to tech stack" },
+  detail_back: { zh: "返回项目列表", en: "Back to projects" },
+  detail_open_workspace: { zh: "在 Paseo 里打开这个 workspace", en: "Open this workspace in Paseo" },
+  detail_no_workspace: {
+    zh: "这个项目当前没有关联的 workspace",
+    en: "No workspace is currently linked to this project",
+  },
+  detail_scan_first: {
+    zh: "还没扫描过\n\n先扫一次，才知道这个项目用了什么",
+    en: "Not scanned yet\n\nScan once to find out what this project uses",
+  },
   stack_why: { zh: "凭什么说我用了它", en: "Why this was detected" },
   stack_evidence_count: (n: number) => ({ zh: `${n} 个证据锚点`, en: `${n} evidence anchors` }),
   stack_pending_group: { zh: "待归类", en: "Pending" },
@@ -480,6 +490,7 @@ const CATALOG = {
     en: "Workspace directory does not match the selected Paseo workspace",
   },
   err_path_not_absolute: { zh: "workspace 目录必须是绝对路径", en: "Workspace directory must be absolute" },
+  err_project_unknown: { zh: "找不到这个项目", en: "Unknown project" },
   err_unknown_node: { zh: "找不到这个知识点", en: "Unknown concept" },
   err_node_foreign: {
     zh: "这个知识点不属于当前项目",
