@@ -73,13 +73,40 @@ test("API 细节比概念衰减得快", () => {
   assert.ok(concept.score > detail.score);
 });
 
-test("证据在同一个 UTC 日内幂等", () => {
+test("没有出处的证据按天去重", () => {
   const first = Date.UTC(2026, 0, 2, 1);
   const second = Date.UTC(2026, 0, 2, 23);
   const nextDay = Date.UTC(2026, 0, 3, 1);
-  assert.equal(evidenceKey("n", "wiki_read", "ref", first), evidenceKey("n", "wiki_read", "ref", second));
-  assert.notEqual(evidenceKey("n", "wiki_read", "ref", first), evidenceKey("n", "wiki_read", "ref", nextDay));
-  assert.notEqual(evidenceKey("n", "wiki_read", "ref", first), evidenceKey("n", "quiz_passed", "ref", first));
+  // 今天翻五遍同一页 wiki 不算学了五次
+  assert.equal(evidenceKey("n", "wiki_read", undefined, first), evidenceKey("n", "wiki_read", undefined, second));
+  // 但明天再翻是新的复习
+  assert.notEqual(evidenceKey("n", "wiki_read", undefined, first), evidenceKey("n", "wiki_read", undefined, nextDay));
+  assert.notEqual(evidenceKey("n", "wiki_read", undefined, first), evidenceKey("n", "quiz_passed", undefined, first));
+});
+
+test("⭐ 有出处的证据跨天也只算一次 —— 否则最强信号可以无限刷", () => {
+  const today = Date.UTC(2026, 0, 2, 1);
+  const nextYear = Date.UTC(2027, 5, 9, 1);
+  // 同一道题明天重答一遍，不该再记一次 quiz_passed（权重 1.5，模型里最强的信号）
+  assert.equal(
+    evidenceKey("n", "quiz_passed", "quiz:abc", today),
+    evidenceKey("n", "quiz_passed", "quiz:abc", nextYear),
+  );
+  // 同一处 agent 改动只该还一次债
+  assert.equal(
+    evidenceKey("n", "agent_wrote_reviewed", "review:xyz", today),
+    evidenceKey("n", "agent_wrote_reviewed", "review:xyz", nextYear),
+  );
+  // 同一个 commit 也只算一次
+  assert.equal(
+    evidenceKey("n", "human_wrote", "commit:deadbeef", today),
+    evidenceKey("n", "human_wrote", "commit:deadbeef", nextYear),
+  );
+  // 不同出处仍然是不同的证据
+  assert.notEqual(
+    evidenceKey("n", "quiz_passed", "quiz:abc", today),
+    evidenceKey("n", "quiz_passed", "quiz:def", today),
+  );
 });
 
 // ── 项目身份 ────────────────────────────────────────────────────────

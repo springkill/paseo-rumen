@@ -182,9 +182,18 @@ export function confidenceForLayers(maxConfidence: number, distinctLayers: numbe
 }
 
 /**
- * 证据的幂等键 = `(node, kind, ref, 天)`。
+ * 证据的幂等键。
  *
- * "今天翻了五遍同一页 wiki"不该算成学了五次，但明天再翻是新的复习，该算。
+ * ⭐ **有唯一出处就按出处去重，没有才按天去重。**
+ *
+ * 两种情况的语义不一样：
+ *
+ * - **有 `reference`**（题目 id、commit sha、还债项 id、agent 的 callId）——
+ *   它已经唯一标识了这件事。再把日期拌进去，明天重答同一道题就又能记一次
+ *   `quiz_passed`（权重 1.5，模型里最强的信号），答对一次就能无限刷。
+ *   同理，同一处 agent 改动的债也只该还一次。
+ * - **没有 `reference`**（"标记已读"这类可重复的用户动作）——
+ *   按天去重：今天翻五遍同一页 wiki 不算学了五次，但明天再翻是新的复习，该算。
  */
 export function evidenceKey(
   nodeId: string,
@@ -192,8 +201,8 @@ export function evidenceKey(
   reference: string | undefined,
   createdAt: number,
 ): string {
-  const day = new Date(createdAt).toISOString().slice(0, 10);
-  return stableHash(`${nodeId}\0${kind}\0${reference ?? ""}\0${day}`);
+  const scope = reference ?? `day:${new Date(createdAt).toISOString().slice(0, 10)}`;
+  return stableHash(`${nodeId}\0${kind}\0${scope}`);
 }
 
 // ── 归因 ────────────────────────────────────────────────────────────

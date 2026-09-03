@@ -879,7 +879,10 @@ export async function nextQuiz(
   const kind: "code" | "concept" = codeAllowed && usage.evidence.length > 0 ? "code" : "concept";
   const id = questionId(node.groupId, kind, lang);
 
-  const existing = state.questions.find((item) => item.id === id && !item.passed);
+  // ⭐ 已存在就原样返回，**包括已经答对的那些**。
+  // 早先这里只找 `!passed` 的，于是题池抽干之后会拿同一个 id 重新生成一道
+  // `passed: false` 的题覆盖掉旧的 —— 等于把"答对过的题不再推送"这条防线拆了。
+  const existing = state.questions.find((item) => item.id === id);
   if (existing) {
     return {
       id: existing.id,
