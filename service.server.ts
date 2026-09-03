@@ -1,31 +1,80 @@
+/**
+ * RPC 处理器：把扫描、生成、观测、归因接成一个产品。
+ */
+
 import type { PluginHandlerContext } from "@getpaseo/plugin";
-import { execFile } from "node:child_process";
-import { mkdir, realpath, writeFile } from "node:fs/promises";
-import { basename, join, relative, resolve, sep } from "node:path";
-import { promisify } from "node:util";
+import { readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type { output as ZodOutput } from "zod";
 import {
+  GenerationBusyError,
+  listGenerationProviders,
+  NoProviderError,
+  resolveProvider,
+} from "./agentrun.server";
+import { collapse, identityColor, type StatusBucket } from "./buckets.shared";
+import { analyzeCommits, type CommitInsight } from "./commits.server";
+import { classifyPending } from "./classify.server";
+import type {
   agentImpactRpc,
   attachmentSearchRpc,
+  classifyRpc,
   commitsRpc,
   dashboardRpc,
   evidenceRpc,
   exportRpc,
+  generateWikiRpc,
+  markReviewedRpc,
   overviewRpc,
   privacyRpc,
   quizAnswerRpc,
   quizNextRpc,
+  reviewSourceRpc,
+  reviewsRpc,
   scanRpc,
+  settingsRpc,
+  updateSettingsRpc,
   wikiRpc,
-  type AgentImpact,
-  type CommitInsight,
-  type Dashboard,
-  type KnowledgeNode,
-  type ProjectSummary,
-  type Technology,
 } from "./contracts.shared";
-import { evidenceKey, masteryOf, stableHash, type EvidenceKind } from "./domain.shared";
-import { identifyProject, resolveProjectRoot, scanWorkspace } from "./scanner.server";
+import type {
+  AgentImpact,
+  Dashboard,
+  KnowledgeNode,
+  ProjectSummary,
+  ReviewItem,
+  Settings,
+  Technology,
+  Wiki,
+} from "./contracts.shared";
+import {
+  evidenceKey,
+  identityStrength,
+  masteryOf,
+  stableHash,
+  type EvidenceKind,
+  type Mastery,
+} from "./domain.shared";
+import {
+  fallbackNodes,
+  generateQuestion,
+  generateWiki,
+  gradeAnswer,
+  gradeLocally,
+  majorVersionOf,
+  MIN_SOURCED_RATIO,
+  questionId,
+  WIKI_SCHEMA_VERSION,
+} from "./generate.server";
+import {
+  LOCALES,
+  resolveLocale,
+  translator,
+  type Locale,
+  type Translator,
+} from "./i18n.shared";
+import { fastPath, ingestMutations, markReviewed, mutationFrom, verdictBucket, type Mutation } from "./observe.server";
+import { allowsGeneration, allowsProjectCode } from "./privacy.shared";
+import { identifyProject, resolveProjectRoot, ScanBoundaryError, scanWorkspace } from "./scanner.server";
 import {
   dataDirectory,
   readState,
@@ -34,447 +83,1247 @@ import {
   type StoredNode,
   type StoredProject,
   type StoredQuestion,
-  type StoredTechnology,
 } from "./store.server";
+import { learnedKey } from "./techmap.shared";
 
-const exec = promisify(execFile);
+type LocaleInput = { clientLocale?: string };
+type WorkspaceInput = LocaleInput & { workspaceId: string; cwd: string };
 
-type WorkspaceInput = { workspaceId: string; cwd: string };
+// ── 语言 ────────────────────────────────────────────────────────────
 
-function record(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+function localeOf(state: RumenState, input: LocaleInput): Locale {
+  return resolveLocale({
+    env: process.env,
+    saved: state.settings.locale === "auto" ? null : state.settings.locale,
+    clientHint: input.clientLocale ?? null,
+  });
 }
 
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+async function tFor(input: LocaleInput): Promise<Translator> {
+  return translator(localeOf(await readState(), input));
 }
 
-async function validateWorkspace(input: WorkspaceInput, context: PluginHandlerContext): Promise<{ root: string; name: string }> {
-  if (!input.cwd.startsWith(sep)) throw new Error("Workspace directory must be absolute");
+// ── workspace 校验 ──────────────────────────────────────────────────
+
+async function validateWorkspace(
+  input: WorkspaceInput,
+  context: PluginHandlerContext,
+  t: Translator,
+): Promise<{ root: string; isGit: boolean; name: string }> {
+  if (!input.cwd.startsWith("/")) throw new Error(t.err_path_not_absolute);
   const snapshot = await context.paseo.workspaces.ref(input.workspaceId).refresh();
-  if (!snapshot || snapshot.id !== input.workspaceId || !snapshot.workspaceDirectory) throw new Error("Workspace is unavailable on this Paseo host");
-  const [supplied, actual] = await Promise.all([realpath(resolve(input.cwd)), realpath(resolve(snapshot.workspaceDirectory))]);
-  if (supplied !== actual) throw new Error("Workspace directory does not match the selected Paseo workspace");
-  const root = await resolveProjectRoot(actual);
-  return { root, name: snapshot.title ?? snapshot.name ?? basename(root) };
+  if (!snapshot || snapshot.id !== input.workspaceId || !snapshot.workspaceDirectory) {
+    throw new Error(t.err_workspace_unavailable);
+  }
+  const supplied = await resolveProjectRoot(input.cwd);
+  const actual = await resolveProjectRoot(snapshot.workspaceDirectory);
+  if (supplied.root !== actual.root) throw new Error(t.err_workspace_mismatch);
+  return { ...actual, name: snapshot.title ?? snapshot.name ?? basename(actual.root) };
 }
 
-function genericNodes(tech: StoredTechnology): StoredNode[] {
-  const prefix = `${tech.id}:`;
-  const basics = `${prefix}fundamentals`;
-  const integration = `${prefix}integration`;
-  return [
-    {
-      id: basics,
-      techId: tech.id,
-      title: `${tech.name} fundamentals`,
-      summary: `Understand the core abstractions, execution model, and vocabulary of ${tech.name}.`,
-      difficulty: 1,
-      prerequisites: [],
-      keywords: [tech.name, "core", "fundamentals", "abstractions"],
-    },
-    {
-      id: integration,
-      techId: tech.id,
-      title: `${tech.name} integration`,
-      summary: `Apply ${tech.name} safely in a real project, including configuration, boundaries, and tests.`,
-      difficulty: 2,
-      prerequisites: [basics],
-      keywords: [tech.name, "configuration", "integration", "tests"],
-    },
-    {
-      id: `${prefix}operations`,
-      techId: tech.id,
-      title: `${tech.name} production and debugging`,
-      summary: `Diagnose failures, performance limits, security concerns, and operational trade-offs in ${tech.name}.`,
-      difficulty: 3,
-      prerequisites: [integration],
-      keywords: [tech.name, "debugging", "performance", "security", "production"],
-    },
-  ];
+function identityKind(id: string): "git" | "root" | "path" {
+  return id.startsWith("git:") ? "git" : id.startsWith("root:") ? "root" : "path";
 }
 
-function ensureNodes(state: RumenState, technologies: StoredTechnology[]) {
-  const known = new Set(state.nodes.map((node) => node.id));
-  for (const technology of technologies) {
-    for (const node of genericNodes(technology)) {
-      if (!known.has(node.id)) {
-        state.nodes.push(node);
-        known.add(node.id);
-      }
+/**
+ * 找到或建立项目记录，必要时**原地升级身份**。
+ *
+ * ⭐ 绑定时若"这个身份没绑过、但**这个路径**已被一个**更弱**的身份绑过"，
+ * 必须把既有记录的 id 原地升级（连同挂在它上面的证据、观测、还债队列一起带走），
+ * **而不是新建项目**。否则同一个项目在生命周期里会被记成三个，历史三分 ——
+ * 而这恰恰是新项目最常见的路径（git init → 首个 commit → git remote add）。
+ *
+ * 反向**永不降级**：用户删掉 remote 后仍保留 `git:` 身份，
+ * 否则此前挂在旧身份上的全部分析结果会失联。
+ */
+function bindProject(
+  state: RumenState,
+  identity: { id: string; name: string },
+  workspace: { root: string; isGit: boolean; name: string },
+  workspaceId: string,
+): StoredProject {
+  let project = state.projects.find((item) => item.id === identity.id);
+  if (!project) {
+    const byPath = state.projects.find((item) => item.root === workspace.root);
+    if (byPath && identityStrength(identity.id) > identityStrength(byPath.id)) {
+      const from = byPath.id;
+      byPath.id = identity.id;
+      for (const item of state.evidence) if (item.projectId === from) item.projectId = identity.id;
+      for (const item of state.observations) if (item.projectId === from) item.projectId = identity.id;
+      for (const item of state.reviews) if (item.projectId === from) item.projectId = identity.id;
+      project = byPath;
+    } else if (byPath && identityStrength(identity.id) <= identityStrength(byPath.id)) {
+      // 永不降级
+      project = byPath;
     }
   }
+  if (!project) {
+    project = {
+      id: identity.id,
+      workspaceIds: [workspaceId],
+      name: workspace.name || identity.name,
+      root: workspace.root,
+      privacy: "private",
+      isGit: workspace.isGit,
+      lastScanAt: null,
+      truncated: false,
+      technologies: [],
+      pending: [],
+      lastAnalyzedSha: null,
+    };
+    state.projects.push(project);
+  }
+  project.root = workspace.root;
+  project.isGit = workspace.isGit;
+  project.name = workspace.name || identity.name;
+  if (!project.workspaceIds.includes(workspaceId)) project.workspaceIds.push(workspaceId);
+  return project;
 }
 
-function masteryForNode(state: RumenState, nodeId: string) {
-  return masteryOf(state.evidence.filter((item) => item.nodeId === nodeId));
-}
-
-function publicNode(state: RumenState, node: StoredNode): KnowledgeNode {
-  return { ...node, mastery: masteryForNode(state, node.id) };
-}
-
-function publicTechnology(state: RumenState, technology: StoredTechnology): Technology {
-  const nodes = state.nodes.filter((node) => node.techId === technology.id).map((node) => publicNode(state, node));
-  const mastery = masteryOf(state.evidence.filter((item) => nodes.some((node) => node.id === item.nodeId)));
-  return { ...technology, mastery, nodes };
-}
-
-function projectSummary(state: RumenState, project: StoredProject, workspaceId?: string): ProjectSummary {
-  const technologies = project.technologies.map((technology) => publicTechnology(state, technology));
-  const nodes = technologies.flatMap((technology) => technology.nodes);
-  const averageMastery = nodes.length ? nodes.reduce((sum, node) => sum + node.mastery.score, 0) / nodes.length : 0;
-  return {
-    id: project.id,
-    workspaceId: workspaceId ?? project.workspaceIds[0] ?? "",
-    name: project.name,
-    root: project.root,
-    privacy: project.privacy,
-    lastScanAt: project.lastScanAt,
-    truncated: project.truncated,
-    techCount: project.technologies.length,
-    averageMastery: Math.round(averageMastery * 10) / 10,
-    totalDebt: nodes.reduce((sum, node) => sum + node.mastery.debt, 0),
-  };
-}
-
-async function ensureProject(input: WorkspaceInput, context: PluginHandlerContext, scan = false): Promise<StoredProject> {
-  const workspace = await validateWorkspace(input, context);
+async function ensureProject(
+  input: WorkspaceInput,
+  context: PluginHandlerContext,
+  t: Translator,
+  options: { scan?: boolean } = {},
+): Promise<StoredProject> {
+  const workspace = await validateWorkspace(input, context, t);
   const identity = await identifyProject(workspace.root);
-  return updateState(async (state) => {
-    let project = state.projects.find((item) => item.id === identity.id || item.root === workspace.root);
-    if (!project) {
-      project = {
-        id: identity.id,
-        workspaceIds: [input.workspaceId],
-        name: workspace.name || identity.name,
-        root: workspace.root,
-        privacy: "private",
-        lastScanAt: null,
-        truncated: false,
-        technologies: [],
-      };
-      state.projects.push(project);
+  const state = await readState();
+  const needsScan = options.scan
+    || !state.projects.find((item) => item.id === identity.id || item.root === workspace.root)?.lastScanAt;
+
+  let scanned: Awaited<ReturnType<typeof scanWorkspace>> | null = null;
+  if (needsScan) {
+    try {
+      scanned = await scanWorkspace(workspace.root, workspace.isGit, state.aliases);
+    } catch (error) {
+      if (error instanceof ScanBoundaryError) {
+        throw new Error(
+          error.reason === "home_or_root"
+            ? t.err_scan_home_directory(error.path)
+            : t.err_scan_too_broad(error.fileCount, error.path),
+        );
+      }
+      throw error;
     }
-    project.id = identity.id;
-    project.root = workspace.root;
-    project.name = workspace.name || identity.name;
-    if (!project.workspaceIds.includes(input.workspaceId)) project.workspaceIds.push(input.workspaceId);
-    if (scan || project.lastScanAt === null) {
-      const result = await scanWorkspace(workspace.root);
-      project.technologies = result.technologies;
-      project.truncated = result.truncated;
+  }
+
+  return updateState((current) => {
+    const project = bindProject(current, identity, workspace, input.workspaceId);
+    if (scanned) {
+      project.technologies = scanned.technologies;
+      project.pending = scanned.pending;
+      project.truncated = scanned.truncated;
       project.lastScanAt = Date.now();
-      ensureNodes(state, result.technologies);
+      const known = new Set(current.techs.map((item) => item.id));
+      for (const tech of scanned.techs) {
+        if (known.has(tech.id)) continue;
+        current.techs.push(tech);
+        known.add(tech.id);
+      }
+      ensureFallbackNodes(current, project, localeOf(current, input));
     }
     return structuredClone(project);
   });
 }
 
-async function git(root: string, args: string[], maxBuffer = 10 * 1024 * 1024): Promise<string> {
-  try {
-    const { stdout } = await exec("git", ["-C", root, ...args], { maxBuffer });
-    return stdout;
-  } catch {
-    return "";
+/**
+ * 给还没生成过 Wiki 的技术补占位知识点。
+ *
+ * 它们标 `origin: "fallback"`，UI 会明说"这是占位的" —— 静默用模板顶替，
+ * 用户会以为"Redis 的知识点就这三条"，那比没有知识点更糟。
+ */
+function ensureFallbackNodes(state: RumenState, project: StoredProject, lang: Locale): void {
+  const generated = new Set(state.nodes.filter((node) => node.origin === "generated").map((node) => node.techId));
+  const existing = new Set(state.nodes.map((node) => node.id));
+  for (const usage of project.technologies) {
+    if (generated.has(usage.techId)) continue;
+    const entity = state.techs.find((item) => item.id === usage.techId);
+    if (!entity) continue;
+    for (const node of fallbackNodes(entity.id, entity.name, lang)) {
+      if (!existing.has(node.id)) {
+        state.nodes.push(node);
+        existing.add(node.id);
+      }
+    }
   }
 }
 
-function authorship(subject: string, body: string) {
-  const value = `${subject}\n${body}`;
-  const markers = [/(co-authored-by:.*(?:claude|codex|copilot|agent))/i, /(?:generated|written|implemented)-by:\s*(?:ai|agent|claude|codex)/i, /\[agent\]|🤖/i];
-  const hits = markers.filter((pattern) => pattern.test(value)).length;
-  if (hits >= 2) return { authorship: "agent" as const, confidence: 0.98 };
-  if (hits === 1) return { authorship: "agent" as const, confidence: 0.95 };
-  return { authorship: "unknown" as const, confidence: 0.3 };
+// ── 投影：存储 → 对外类型 ───────────────────────────────────────────
+
+function masteryFor(state: RumenState, groupId: string, difficulty: number, now: number): Mastery {
+  return masteryOf(
+    state.evidence.filter((item) => item.nodeGroupId === groupId),
+    now,
+    difficulty,
+  );
 }
 
-async function analyzeCommits(project: StoredProject, state: RumenState, limit: number): Promise<CommitInsight[]> {
-  const format = "%x1e%H%x1f%ct%x1f%s%x1f%b";
-  const output = await git(project.root, ["log", `-${limit}`, `--pretty=format:${format}`, "--numstat"], 30 * 1024 * 1024);
-  if (!output.trim()) return [];
-  const technologies = project.technologies.map((technology) => publicTechnology(state, technology));
-  const commits: CommitInsight[] = [];
-  for (const chunk of output.split("\x1e").filter(Boolean)) {
-    const lines = chunk.split(/\r?\n/);
-    const header = lines.shift()?.split("\x1f") ?? [];
-    if (header.length < 4) continue;
-    const [sha, timestamp, subject, ...bodyParts] = header;
-    const body = bodyParts.join("\x1f");
-    let filesChanged = 0;
-    let insertions = 0;
-    let deletions = 0;
-    const files: string[] = [];
-    for (const line of lines) {
-      const match = line.match(/^(\d+|-)\s+(\d+|-)\s+(.+)$/);
-      if (!match) continue;
-      filesChanged += 1;
-      insertions += match[1] === "-" ? 0 : Number(match[1]);
-      deletions += match[2] === "-" ? 0 : Number(match[2]);
-      files.push(match[3]);
+/** 一个技术在某语言下的知识点。没有该语言的就退回任意已有语言 —— 有内容比语言一致重要。 */
+function nodesFor(state: RumenState, techId: string, lang: Locale): StoredNode[] {
+  const all = state.nodes.filter((node) => node.techId === techId);
+  const preferred = all.filter((node) => node.lang === lang);
+  if (preferred.length > 0) return preferred;
+  const generated = all.filter((node) => node.origin === "generated");
+  return generated.length > 0 ? generated : all;
+}
+
+function graspedSet(state: RumenState, now: number): Set<string> {
+  const byGroup = new Map<string, number>();
+  for (const node of state.nodes) byGroup.set(node.groupId, node.difficulty);
+  const out = new Set<string>();
+  for (const [groupId, difficulty] of byGroup) {
+    if (masteryFor(state, groupId, difficulty, now).grasped) out.add(groupId);
+  }
+  return out;
+}
+
+function publicNode(
+  state: RumenState,
+  node: StoredNode,
+  techName: string,
+  grasped: ReadonlySet<string>,
+  now: number,
+): KnowledgeNode {
+  return {
+    groupId: node.groupId,
+    techId: node.techId,
+    techName,
+    lang: node.lang,
+    title: node.title,
+    summary: node.summary,
+    difficulty: node.difficulty,
+    prerequisites: node.prerequisites,
+    blockedBy: node.prerequisites.filter((id) => !grasped.has(id)).length,
+    origin: node.origin,
+    mastery: masteryFor(state, node.groupId, node.difficulty, now),
+  };
+}
+
+function publicTechnology(
+  state: RumenState,
+  project: StoredProject,
+  techId: string,
+  lang: Locale,
+  grasped: ReadonlySet<string>,
+  now: number,
+): Technology | null {
+  const entity = state.techs.find((item) => item.id === techId);
+  const usage = project.technologies.find((item) => item.techId === techId);
+  if (!entity || !usage) return null;
+  const stored = nodesFor(state, techId, lang);
+  const nodes = stored.map((node) => publicNode(state, node, entity.name, grasped, now));
+  const groupIds = new Set(stored.map((node) => node.groupId));
+  const mastery = masteryOf(
+    state.evidence.filter((item) => groupIds.has(item.nodeGroupId)),
+    now,
+    Math.max(1, ...stored.map((node) => node.difficulty)),
+  );
+  return {
+    id: entity.id,
+    name: entity.name,
+    category: entity.category,
+    version: usage.version,
+    confidence: usage.confidence,
+    worthLearning: entity.worthLearning,
+    packages: usage.packages,
+    evidence: usage.evidence,
+    mastery,
+    nodes,
+    hasWiki: state.wikis.some((wiki) => wiki.techId === techId),
+  };
+}
+
+function projectBucket(unreviewed: number, debt: number): StatusBucket {
+  if (unreviewed > 0 || debt > 0) return "attention";
+  return "done";
+}
+
+function projectSummary(
+  state: RumenState,
+  project: StoredProject,
+  lang: Locale,
+  grasped: ReadonlySet<string>,
+  now: number,
+  workspaceId?: string,
+): ProjectSummary {
+  const technologies = project.technologies
+    .map((usage) => publicTechnology(state, project, usage.techId, lang, grasped, now))
+    .filter((item): item is Technology => item !== null);
+  const nodes = technologies.flatMap((technology) => technology.nodes);
+  const averageMastery = nodes.length
+    ? nodes.reduce((sum, node) => sum + node.mastery.score, 0) / nodes.length
+    : 0;
+  const totalDebt = nodes.reduce((sum, node) => sum + node.mastery.debt, 0);
+  const unreviewed = state.reviews.filter(
+    (review) => review.projectId === project.id && review.reviewedAt === null,
+  ).length;
+  return {
+    id: project.id,
+    workspaceId: workspaceId ?? project.workspaceIds[0] ?? "",
+    name: project.name,
+    root: project.root,
+    color: identityColor(project.id),
+    privacy: project.privacy,
+    isGit: project.isGit,
+    identityKind: identityKind(project.id),
+    lastScanAt: project.lastScanAt,
+    truncated: project.truncated,
+    techCount: project.technologies.length,
+    pendingCount: project.pending.length,
+    averageMastery: Math.round(averageMastery * 10) / 10,
+    totalDebt,
+    unreviewedCount: unreviewed,
+    bucket: projectBucket(unreviewed, totalDebt),
+  };
+}
+
+function publicReviews(
+  state: RumenState,
+  project: StoredProject,
+  lang: Locale,
+  grasped: ReadonlySet<string>,
+  now: number,
+  includeDone: boolean,
+): ReviewItem[] {
+  const techName = new Map(state.techs.map((item) => [item.id, item.name]));
+  const byGroup = new Map<string, StoredNode>();
+  for (const node of state.nodes) {
+    const existing = byGroup.get(node.groupId);
+    if (!existing || (node.lang === lang && existing.lang !== lang)) byGroup.set(node.groupId, node);
+  }
+  return state.reviews
+    .filter((review) => review.projectId === project.id && (includeDone || review.reviewedAt === null))
+    .sort((left, right) => right.observedAt - left.observedAt)
+    .slice(0, 100)
+    .map((review) => ({
+      id: review.id,
+      agentId: review.agentId,
+      file: review.file,
+      observedAt: review.observedAt,
+      reviewedAt: review.reviewedAt,
+      nodes: review.nodeGroupIds
+        .map((groupId) => byGroup.get(groupId))
+        .filter((node): node is StoredNode => Boolean(node))
+        .map((node) => publicNode(state, node, techName.get(node.techId) ?? node.techId, grasped, now)),
+    }));
+}
+
+// ── 观测：从 Paseo 时间线摄取 ───────────────────────────────────────
+
+async function collectMutations(
+  context: PluginHandlerContext,
+  agentId: string,
+  root: string,
+  limit = 300,
+): Promise<{ mutations: Mutation[]; status: string | null; provider: string; title: string | null }> {
+  const page = await context.paseo.agents.ref(agentId).timeline.refetch({
+    direction: "tail",
+    limit,
+    projection: "canonical",
+  });
+  const mutations: Mutation[] = [];
+  for (const entry of page.entries) {
+    const mutation = mutationFrom(entry.item, entry.timestamp, root);
+    if (mutation) mutations.push(mutation);
+  }
+  return {
+    mutations,
+    status: page.agent?.status ?? null,
+    provider: page.agent?.provider ?? "",
+    title: page.agent?.title ?? null,
+  };
+}
+
+function agentBucket(status: string | null, requiresAttention: boolean, candidates: number): StatusBucket {
+  if (requiresAttention) return "needs_input";
+  if (candidates > 0) return "new_knowledge";
+  if (status === "error") return "failed";
+  if (status === "running") return "running";
+  return "done";
+}
+
+/** 把这个项目下所有活着的 agent 的改动摄取进来。 */
+async function ingestLiveAgents(
+  context: PluginHandlerContext,
+  project: StoredProject,
+  workspaceId: string,
+  lang: Locale,
+): Promise<Dashboard["liveAgents"]> {
+  let page;
+  try {
+    page = await context.paseo.agents.list({ scope: "active", page: { limit: 50 } });
+  } catch {
+    return [];
+  }
+  const state = await readState();
+  const grasped = graspedSet(state, Date.now());
+  const knownPackages = new Set(
+    project.technologies.flatMap((usage) => usage.packages.map((pkg) => pkg.toLowerCase())),
+  );
+  for (const item of project.pending) knownPackages.add(item.pkg.toLowerCase());
+
+  const live: Dashboard["liveAgents"] = [];
+  for (const entry of page.entries) {
+    const agent = entry.agent;
+    if (!agent?.id || agent.workspaceId !== workspaceId) continue;
+    // 我们自己起的生成会话不算用户的 agent
+    if (agent.labels?.["rumen.task"]) continue;
+    const agentId = agent.id;
+
+    const observed = await collectMutations(context, agentId, project.root, 200).catch(() => null);
+    if (!observed) continue;
+
+    const nodes = state.nodes;
+    const ingest = ingestMutations({
+      project,
+      nodes,
+      agentId,
+      mutations: observed.mutations,
+      grasped,
+      existingObservationIds: new Set(state.observations.map((item) => item.id)),
+      existingReviewIds: new Set(state.reviews.map((item) => item.id)),
+    });
+    if (ingest.observations.length || ingest.reviews.length || ingest.evidence.length) {
+      await updateState((current) => {
+        const observationIds = new Set(current.observations.map((item) => item.id));
+        for (const item of ingest.observations) {
+          if (!observationIds.has(item.id)) current.observations.push(item);
+        }
+        const reviewIds = new Set(current.reviews.map((item) => item.id));
+        for (const item of ingest.reviews) if (!reviewIds.has(item.id)) current.reviews.push(item);
+        const evidenceIds = new Set(current.evidence.map((item) => item.id));
+        for (const item of ingest.evidence) if (!evidenceIds.has(item.id)) current.evidence.push(item);
+      });
     }
-    const touched = technologies.filter((technology) => technology.evidence.some((item) => files.includes(item.file)));
-    const debt = touched.flatMap((technology) => technology.nodes).filter((node) => !node.mastery.grasped).length;
-    const attribution = authorship(subject, body);
-    commits.push({
-      sha,
-      subject,
-      authoredAt: Number(timestamp) * 1000,
-      ...attribution,
-      filesChanged,
-      insertions,
-      deletions,
-      touchedTechs: touched.map((item) => item.name),
-      knowledgeDebt: debt,
+
+    const verdict = await fastPath({
+      project,
+      mutations: observed.mutations,
+      learned: state.aliases,
+      knownPackages,
+    });
+    live.push({
+      agentId,
+      title: observed.title,
+      provider: observed.provider,
+      bucket: agentBucket(observed.status, Boolean(agent.requiresAttention), verdict.candidates.length),
+      newKnowledge: verdict.candidates,
     });
   }
-  return commits;
+  return live;
 }
 
-async function dashboardFor(project: StoredProject, workspaceId: string): Promise<Dashboard> {
-  const state = await readState();
-  const stored = state.projects.find((item) => item.id === project.id) ?? project;
-  ensureNodes(state, stored.technologies);
-  const technologies = stored.technologies.map((technology) => publicTechnology(state, technology));
-  const readyNodes = technologies.flatMap((technology) => technology.nodes).filter((node) => {
-    if (node.mastery.grasped) return false;
-    return node.prerequisites.every((id) => masteryForNode(state, id).grasped);
-  }).sort((left, right) => left.difficulty - right.difficulty || left.mastery.score - right.mastery.score).slice(0, 30);
-  return {
-    project: projectSummary(state, stored, workspaceId),
-    technologies,
-    readyNodes,
-    commits: await analyzeCommits(stored, state, 30),
-  };
-}
+// ── 生成能力的可用性 ────────────────────────────────────────────────
 
-export async function getDashboard(input: ZodOutput<typeof dashboardRpc.input>, context: PluginHandlerContext) {
-  return dashboardFor(await ensureProject(input, context), input.workspaceId);
-}
-
-export async function scan(input: ZodOutput<typeof scanRpc.input>, context: PluginHandlerContext) {
-  return dashboardFor(await ensureProject(input, context, true), input.workspaceId);
-}
-
-export async function setPrivacy(input: ZodOutput<typeof privacyRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return updateState((state) => {
-    const stored = state.projects.find((item) => item.id === project.id)!;
-    stored.privacy = input.privacy;
-    return projectSummary(state, stored, input.workspaceId);
-  });
-}
-
-export async function recordEvidence(input: ZodOutput<typeof evidenceRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return updateState((state) => {
-    const node = state.nodes.find((item) => item.id === input.nodeId);
-    if (!node) throw new Error("Unknown knowledge node");
-    if (!project.technologies.some((item) => item.id === node.techId)) throw new Error("Knowledge node does not belong to this workspace");
-    const createdAt = Date.now();
-    const id = evidenceKey(input.nodeId, input.kind as EvidenceKind, input.reference, createdAt);
-    if (!state.evidence.some((item) => item.id === id)) {
-      state.evidence.push({ id, nodeId: input.nodeId, projectId: project.id, kind: input.kind as EvidenceKind, reference: input.reference, createdAt });
-    }
-    return masteryForNode(state, input.nodeId);
-  });
-}
-
-function wikiBody(technology: StoredTechnology, nodes: StoredNode[]): string {
-  const sections = nodes.map((node) => `## ${node.title}\n\n${node.summary}\n\n### Review checklist\n\n- Explain the main abstraction in your own words.\n- Locate its configuration and boundaries in the current workspace.\n- Identify one failure mode and one test that catches it.\n`).join("\n");
-  return `# ${technology.name}\n\n> Rumen local knowledge guide. Verify version-specific details against official documentation before making production decisions.\n\n## Why it matters here\n\nThis workspace contains ${technology.evidence.length} local evidence anchor${technology.evidence.length === 1 ? "" : "s"} for ${technology.name}. The guide focuses on understanding the code you and your agents are changing.\n\n${sections}`;
-}
-
-export async function getWiki(input: ZodOutput<typeof wikiRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return updateState((state) => {
-    const technology = project.technologies.find((item) => item.id === input.techId);
-    if (!technology) throw new Error("Technology is not present in this workspace");
-    let wiki = state.wikis.find((item) => item.projectId === project.id && item.techId === technology.id);
-    if (!wiki || input.force) {
-      const nodes = state.nodes.filter((node) => node.techId === technology.id);
-      wiki = {
-        projectId: project.id,
-        techId: technology.id,
-        title: technology.name,
-        body: wikiBody(technology, nodes),
-        generatedAt: Date.now(),
-        sourceCount: 0,
-        sourcedRatio: 0,
-      };
-      state.wikis = [...state.wikis.filter((item) => item.projectId !== project.id || item.techId !== technology.id), wiki];
-    }
-    return { ...wiki, anchors: technology.evidence };
-  });
-}
-
-function questionFor(node: StoredNode): StoredQuestion {
-  return {
-    id: `quiz:${stableHash(`${node.id}:${node.title}`)}`,
-    techId: node.techId,
-    nodeId: node.id,
-    prompt: `In your own words, explain ${node.title}. Mention at least two important ideas and one practical check you would make in this workspace.`,
-    keywords: node.keywords,
-    createdAt: Date.now(),
-    passed: false,
-    attempts: 0,
-  };
-}
-
-export async function nextQuiz(input: ZodOutput<typeof quizNextRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return updateState((state) => {
-    if (!project.technologies.some((item) => item.id === input.techId)) throw new Error("Technology is not present in this workspace");
-    const candidates = state.nodes.filter((node) => node.techId === input.techId).sort((left, right) => masteryForNode(state, left.id).score - masteryForNode(state, right.id).score);
-    const node = candidates.find((item) => !state.questions.find((question) => question.nodeId === item.id)?.passed) ?? candidates[0];
-    if (!node) throw new Error("This technology has no knowledge nodes");
-    let question = state.questions.find((item) => item.nodeId === node.id && !item.passed);
-    if (!question) {
-      question = questionFor(node);
-      state.questions.push(question);
-    }
-    return { id: question.id, techId: question.techId, nodeId: question.nodeId, nodeTitle: node.title, prompt: question.prompt };
-  });
-}
-
-export async function answerQuiz(input: ZodOutput<typeof quizAnswerRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return updateState((state) => {
-    const question = state.questions.find((item) => item.id === input.questionId);
-    if (!question) throw new Error("Unknown quiz question");
-    if (!project.technologies.some((item) => item.id === question.techId)) throw new Error("Quiz does not belong to this workspace");
-    const normalized = input.answer.toLowerCase();
-    const matched = question.keywords.filter((keyword) => normalized.includes(keyword.toLowerCase()));
-    const depthBonus = Math.min(0.35, normalized.split(/\s+/).filter(Boolean).length / 120);
-    const score = Math.min(1, matched.length / Math.max(2, question.keywords.length) + depthBonus);
-    const passed = score >= 0.7;
-    question.attempts += 1;
-    question.passed ||= passed;
-    if (passed) {
-      const createdAt = Date.now();
-      const id = evidenceKey(question.nodeId, "quiz_passed", question.id, createdAt);
-      if (!state.evidence.some((item) => item.id === id)) state.evidence.push({ id, nodeId: question.nodeId, projectId: project.id, kind: "quiz_passed", reference: question.id, createdAt });
-    }
-    return {
-      passed,
-      score: Math.round(score * 100) / 100,
-      feedback: passed ? "Passed. The answer covered enough of the node's core vocabulary and included useful detail." : `Not yet. Expand the answer with concrete details about ${question.keywords.slice(0, 3).join(", ")}.`,
-      mastery: masteryForNode(state, question.nodeId),
-    };
-  });
-}
-
-export async function listCommits(input: ZodOutput<typeof commitsRpc.input>, context: PluginHandlerContext) {
-  const project = await ensureProject(input, context);
-  return { commits: await analyzeCommits(project, await readState(), input.limit) };
-}
-
-interface ObservedMutation { callId: string; filePath: string; timestamp: number }
-
-function mutationFromTool(item: unknown, timestamp: unknown): ObservedMutation | null {
-  const value = record(item);
-  if (!value || value.type !== "tool_call" || value.status !== "completed") return null;
-  const detail = record(value.detail);
-  if (!detail || (detail.type !== "edit" && detail.type !== "write")) return null;
-  const filePath = text(detail.filePath);
-  const callId = text(value.callId);
-  if (!filePath || !callId) return null;
-  const observedAt = typeof timestamp === "string" || typeof timestamp === "number" ? new Date(timestamp).getTime() : Number.NaN;
-  return { callId, filePath, timestamp: Number.isFinite(observedAt) ? observedAt : Date.now() };
-}
-
-export async function getAgentImpact(input: ZodOutput<typeof agentImpactRpc.input>, context: PluginHandlerContext): Promise<AgentImpact> {
-  const project = await ensureProject(input, context);
-  const page = await context.paseo.agents.ref(input.agentId).timeline.refetch({ direction: "tail", limit: 300, projection: "canonical" });
-  if (page.agent?.id !== input.agentId || page.agent.workspaceId !== input.workspaceId) throw new Error("Agent does not belong to the selected workspace");
-  const files = new Set<string>();
-  const mutations: Array<ObservedMutation & { relativePath: string }> = [];
-  for (const entry of page.entries) {
-    const mutation = mutationFromTool(entry.item, entry.timestamp);
-    if (!mutation) continue;
-    const absolute = mutation.filePath.startsWith(sep) ? resolve(mutation.filePath) : resolve(project.root, mutation.filePath);
-    const relativePath = relative(project.root, absolute);
-    if (relativePath.startsWith("..") || relativePath.startsWith(sep)) continue;
-    files.add(relativePath);
-    mutations.push({ ...mutation, relativePath });
+async function generationStatus(
+  context: PluginHandlerContext,
+  project: StoredProject,
+  provider: string | null,
+): Promise<Dashboard["generation"]> {
+  if (!allowsGeneration(project.privacy)) {
+    return { available: false, reason: "airgapped", codeQuizAllowed: false };
   }
+  try {
+    await resolveProvider(context.paseo, provider);
+  } catch {
+    return { available: false, reason: "no_provider", codeQuizAllowed: false };
+  }
+  return { available: true, reason: "ok", codeQuizAllowed: allowsProjectCode(project.privacy) };
+}
+
+// ── Dashboard ───────────────────────────────────────────────────────
+
+async function dashboardFor(
+  context: PluginHandlerContext,
+  project: StoredProject,
+  input: WorkspaceInput,
+): Promise<Dashboard> {
+  const liveAgents = await ingestLiveAgents(context, project, input.workspaceId, "en").catch(() => []);
   const state = await readState();
-  const technologies = project.technologies.map((item) => publicTechnology(state, item));
-  const touched = technologies.filter((technology) => technology.evidence.some((anchor) => files.has(anchor.file)));
-  const weakNodes = touched.flatMap((technology) => technology.nodes).filter((node) => !node.mastery.grasped).slice(0, 30);
-  if (weakNodes.length && mutations.length) {
+  const lang = localeOf(state, input);
+  const now = Date.now();
+  const stored = state.projects.find((item) => item.id === project.id) ?? project;
+  const grasped = graspedSet(state, now);
+
+  const technologies = stored.technologies
+    .map((usage) => publicTechnology(state, stored, usage.techId, lang, grasped, now))
+    .filter((item): item is Technology => item !== null)
+    .sort((left, right) =>
+      Number(right.worthLearning) - Number(left.worthLearning)
+      || right.confidence - left.confidence
+      || left.name.localeCompare(right.name));
+
+  const readyNodes = technologies
+    .filter((technology) => technology.worthLearning)
+    .flatMap((technology) => technology.nodes)
+    .filter((node) => !node.mastery.grasped && node.blockedBy === 0)
+    .sort((left, right) =>
+      right.mastery.debt - left.mastery.debt
+      || left.difficulty - right.difficulty
+      || left.mastery.score - right.mastery.score)
+    .slice(0, 30);
+
+  const commits = await analyzeAndRecord(stored, state, 40);
+
+  return {
+    project: projectSummary(state, stored, lang, grasped, now, input.workspaceId),
+    technologies,
+    pending: stored.pending.slice(0, 60),
+    readyNodes,
+    commits,
+    reviews: publicReviews(state, stored, lang, grasped, now, false),
+    liveAgents,
+    generation: await generationStatus(context, stored, state.settings.provider),
+  };
+}
+
+/** 跑一次 commit 分析并把新证据落库（幂等）。 */
+async function analyzeAndRecord(
+  project: StoredProject,
+  state: RumenState,
+  limit: number,
+): Promise<CommitInsight[]> {
+  if (!project.isGit) return [];
+  const now = Date.now();
+  const result = await analyzeCommits({
+    project,
+    techs: new Map(state.techs.map((item) => [item.id, item])),
+    nodes: state.nodes,
+    observations: state.observations,
+    grasped: graspedSet(state, now),
+    limit,
+  });
+  if (result.evidence.length > 0) {
     await updateState((current) => {
-      for (const node of weakNodes) {
-        const technology = project.technologies.find((item) => item.id === node.techId);
-        const relevant = mutations.filter((mutation) => technology?.evidence.some((anchor) => anchor.file === mutation.relativePath));
-        for (const mutation of relevant) {
-          const reference = `agent:${input.agentId}:call:${mutation.callId}`;
-          const id = evidenceKey(node.id, "agent_wrote_unreviewed", reference, mutation.timestamp);
-          if (!current.evidence.some((item) => item.id === id)) current.evidence.push({ id, nodeId: node.id, projectId: project.id, kind: "agent_wrote_unreviewed", reference, createdAt: mutation.timestamp });
+      const seen = new Set(current.evidence.map((item) => item.id));
+      for (const item of result.evidence) {
+        if (!seen.has(item.id)) {
+          current.evidence.push(item);
+          seen.add(item.id);
         }
       }
     });
   }
-  const refreshed = await readState();
-  const finalWeak = weakNodes.map((node) => publicNode(refreshed, refreshed.nodes.find((item) => item.id === node.id)!));
+  return result.insights;
+}
+
+// ── Handlers ────────────────────────────────────────────────────────
+
+export async function getDashboard(
+  input: ZodOutput<typeof dashboardRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Dashboard> {
+  const t = await tFor(input);
+  return dashboardFor(context, await ensureProject(input, context, t), input);
+}
+
+export async function scan(
+  input: ZodOutput<typeof scanRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Dashboard> {
+  const t = await tFor(input);
+  return dashboardFor(context, await ensureProject(input, context, t, { scan: true }), input);
+}
+
+export async function classify(
+  input: ZodOutput<typeof classifyRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  if (!allowsGeneration(project.privacy)) throw new Error(t.err_airgapped);
+  const state = await readState();
+  if (project.pending.length === 0) return { classified: 0, merged: 0 };
+
+  let learned;
+  try {
+    learned = await classifyPending({
+      paseo: context.paseo,
+      cwd: project.root,
+      provider: state.settings.provider,
+      deferToUserAgents: state.settings.deferToUserAgents,
+      pending: project.pending,
+    });
+  } catch (error) {
+    throw new Error(describeGenerationError(error, t));
+  }
+
+  return updateState((current) => {
+    const index = new Map(current.aliases.map((item) => [learnedKey(item.pkg, item.ecosystem), item]));
+    for (const alias of learned) index.set(learnedKey(alias.pkg, alias.ecosystem), alias);
+    current.aliases = [...index.values()];
+    const merged = learned.filter((item) => item.techId !== null).length;
+    // 重扫在下一次 dashboard 请求里发生 —— 这里只清掉待归类池，让用户看到进展
+    const stored = current.projects.find((item) => item.id === project.id);
+    if (stored) {
+      const resolved = new Set(learned.map((item) => item.pkg));
+      stored.pending = stored.pending.filter((item) => !resolved.has(item.pkg.toLowerCase()));
+      stored.lastScanAt = null; // 下次 dashboard 会重扫，把新 alias 用上
+    }
+    return { classified: learned.length, merged };
+  });
+}
+
+export async function setPrivacy(
+  input: ZodOutput<typeof privacyRpc.input>,
+  context: PluginHandlerContext,
+): Promise<ProjectSummary> {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  return updateState((current) => {
+    const stored = current.projects.find((item) => item.id === project.id);
+    if (!stored) throw new Error(t.err_workspace_unavailable);
+    stored.privacy = input.privacy;
+    const now = Date.now();
+    return projectSummary(current, stored, localeOf(current, input), graspedSet(current, now), now, input.workspaceId);
+  });
+}
+
+export async function recordEvidence(
+  input: ZodOutput<typeof evidenceRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Mastery> {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  return updateState((current) => {
+    const node = current.nodes.find((item) => item.groupId === input.nodeGroupId);
+    if (!node) throw new Error(t.err_unknown_node);
+    if (!project.technologies.some((item) => item.techId === node.techId)) {
+      throw new Error(t.err_node_foreign);
+    }
+    const createdAt = Date.now();
+    const id = evidenceKey(input.nodeGroupId, input.kind as EvidenceKind, input.reference, createdAt);
+    if (!current.evidence.some((item) => item.id === id)) {
+      current.evidence.push({
+        id,
+        nodeGroupId: input.nodeGroupId,
+        projectId: project.id,
+        kind: input.kind as EvidenceKind,
+        reference: input.reference,
+        createdAt,
+      });
+    }
+    return masteryFor(current, input.nodeGroupId, node.difficulty, createdAt);
+  });
+}
+
+// ── Wiki ────────────────────────────────────────────────────────────
+
+function projectWiki(
+  state: RumenState,
+  project: StoredProject,
+  techId: string,
+  lang: Locale,
+): Wiki | null {
+  const usage = project.technologies.find((item) => item.techId === techId);
+  const entity = state.techs.find((item) => item.id === techId);
+  if (!usage || !entity) return null;
+  const major = majorVersionOf(usage.version);
+  const candidates = state.wikis.filter(
+    (wiki) => wiki.techId === techId && wiki.schemaVersion === WIKI_SCHEMA_VERSION,
+  );
+  if (candidates.length === 0) return null;
+  const exact = candidates.find((wiki) => wiki.lang === lang && wiki.majorVersion === major)
+    ?? candidates.find((wiki) => wiki.lang === lang)
+    ?? candidates.find((wiki) => wiki.majorVersion === major)
+    ?? candidates[0]!;
   return {
-    agentId: input.agentId,
-    projectName: project.name,
-    active: page.agent?.status === "running",
-    touchedFiles: [...files].slice(-80),
-    touchedTechs: touched.map((technology) => technology.name),
-    weakNodes: finalWeak,
-    newKnowledge: touched.filter((technology) => technology.mastery.score === 0).map((technology) => technology.name),
-    totalDebt: finalWeak.reduce((sum, node) => sum + node.mastery.debt, 0),
+    techId,
+    title: entity.name,
+    lang: exact.lang,
+    summary: exact.summary,
+    sections: exact.sections,
+    sources: exact.sources,
+    generatedAt: exact.generatedAt,
+    sourcedRatio: exact.sourcedRatio,
+    trustworthy: exact.sourcedRatio >= MIN_SOURCED_RATIO,
+    anchors: usage.evidence,
+    availableLangs: [...new Set(candidates.map((wiki) => wiki.lang))],
   };
 }
 
-export async function overview(_input: ZodOutput<typeof overviewRpc.input>) {
+export async function getWiki(
+  input: ZodOutput<typeof wikiRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Wiki | null> {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
   const state = await readState();
-  const allNodes = state.nodes.map((node) => publicNode(state, node));
-  const uniqueTech = new Set(state.projects.flatMap((project) => project.technologies.map((technology) => technology.id)));
+  return projectWiki(state, project, input.techId, input.lang ?? localeOf(state, input));
+}
+
+export async function generateWikiFor(
+  input: ZodOutput<typeof generateWikiRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Wiki> {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  if (!allowsGeneration(project.privacy)) throw new Error(t.err_airgapped);
+
+  const state = await readState();
+  const usage = project.technologies.find((item) => item.techId === input.techId);
+  const entity = state.techs.find((item) => item.id === input.techId);
+  if (!usage || !entity) throw new Error(t.err_tech_absent);
+
+  const major = majorVersionOf(usage.version);
+  const cached = state.wikis.find(
+    (wiki) => wiki.techId === input.techId
+      && wiki.lang === input.lang
+      && wiki.majorVersion === major
+      && wiki.schemaVersion === WIKI_SCHEMA_VERSION,
+  );
+  // ⭐ Shared 层的缓存命中是跨项目的：第 100 个用 Express 的项目零成本
+  if (cached && !input.force) {
+    const existing = projectWiki(state, project, input.techId, input.lang);
+    if (existing) return existing;
+  }
+
+  let generated;
+  try {
+    generated = await generateWiki({
+      paseo: context.paseo,
+      cwd: project.root,
+      provider: state.settings.provider,
+      deferToUserAgents: state.settings.deferToUserAgents,
+      privacy: project.privacy,
+      techId: entity.id,
+      techName: entity.name,
+      majorVersion: major,
+      lang: input.lang,
+    });
+  } catch (error) {
+    throw new Error(describeGenerationError(error, t));
+  }
+
+  return updateState((current) => {
+    current.wikis = [
+      ...current.wikis.filter(
+        (wiki) => !(wiki.techId === entity.id && wiki.lang === input.lang && wiki.majorVersion === major),
+      ),
+      generated.wiki,
+    ];
+    // ⭐ 按 id upsert，只删掉**没有证据**的陈旧占位知识点。
+    // 整体删除再重建会级联删掉用户几个月的掌握度和证据 —— 换个语言看文档
+    // 就丢掉学习记录，这是绝对不能有的。
+    const withEvidence = new Set(current.evidence.map((item) => item.nodeGroupId));
+    current.nodes = current.nodes.filter((node) =>
+      node.techId !== entity.id
+      || node.origin === "generated"
+      || withEvidence.has(node.groupId));
+    const byId = new Map(current.nodes.map((node) => [node.id, node]));
+    for (const node of generated.nodes) byId.set(node.id, node);
+    current.nodes = [...byId.values()];
+
+    const stored = current.projects.find((item) => item.id === project.id) ?? project;
+    return projectWiki(current, stored, entity.id, input.lang)!;
+  });
+}
+
+// ── 检验题 ──────────────────────────────────────────────────────────
+
+export async function nextQuiz(
+  input: ZodOutput<typeof quizNextRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  const state = await readState();
+  const lang = localeOf(state, input);
+  const now = Date.now();
+
+  const usage = project.technologies.find((item) => item.techId === input.techId);
+  const entity = state.techs.find((item) => item.id === input.techId);
+  if (!usage || !entity) throw new Error(t.err_tech_absent);
+
+  const candidates = nodesFor(state, input.techId, lang);
+  if (candidates.length === 0) throw new Error(t.err_no_nodes);
+
+  // ⭐ 答对过的题不再推送 —— 否则答对一次就能无限刷 QUIZ_PASSED
+  const passed = new Set(state.questions.filter((item) => item.passed).map((item) => item.nodeGroupId));
+  const pool = candidates.filter((node) => !passed.has(node.groupId));
+  const target = input.nodeGroupId
+    ? candidates.find((node) => node.groupId === input.nodeGroupId)
+    : undefined;
+  const node = target
+    ?? pool
+      .slice()
+      .sort((left, right) =>
+        masteryFor(state, left.groupId, left.difficulty, now).score
+        - masteryFor(state, right.groupId, right.difficulty, now).score)[0]
+    ?? candidates[0]!;
+
+  const codeAllowed = allowsProjectCode(project.privacy);
+  const kind: "code" | "concept" = codeAllowed && usage.evidence.length > 0 ? "code" : "concept";
+  const id = questionId(node.groupId, kind, lang);
+
+  const existing = state.questions.find((item) => item.id === id && !item.passed);
+  if (existing) {
+    return {
+      id: existing.id,
+      techId: existing.techId,
+      nodeGroupId: existing.nodeGroupId,
+      nodeTitle: node.title,
+      prompt: existing.prompt,
+      kind: existing.kind,
+      degraded: existing.kind === "concept" && !codeAllowed,
+    };
+  }
+
+  if (!allowsGeneration(project.privacy)) throw new Error(t.err_airgapped);
+  let generated;
+  try {
+    generated = await generateQuestion({
+      paseo: context.paseo,
+      cwd: project.root,
+      provider: state.settings.provider,
+      deferToUserAgents: state.settings.deferToUserAgents,
+      privacy: project.privacy,
+      techName: entity.name,
+      nodeTitle: node.title,
+      nodeSummary: node.summary,
+      anchors: usage.evidence,
+      lang,
+    });
+  } catch (error) {
+    throw new Error(describeGenerationError(error, t));
+  }
+
+  const question: StoredQuestion = {
+    id,
+    techId: input.techId,
+    nodeGroupId: node.groupId,
+    lang,
+    kind: generated.kind,
+    prompt: generated.prompt,
+    rubric: generated.rubric,
+    anchors: generated.kind === "code" ? usage.evidence.slice(0, 8) : [],
+    createdAt: now,
+    passed: false,
+    attempts: 0,
+  };
+  await updateState((current) => {
+    current.questions = [...current.questions.filter((item) => item.id !== id), question];
+  });
+
   return {
-    projects: state.projects.map((project) => projectSummary(state, project)),
+    id: question.id,
+    techId: question.techId,
+    nodeGroupId: question.nodeGroupId,
+    nodeTitle: node.title,
+    prompt: question.prompt,
+    kind: question.kind,
+    degraded: question.kind === "concept" && !codeAllowed,
+  };
+}
+
+export async function answerQuiz(
+  input: ZodOutput<typeof quizAnswerRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  const state = await readState();
+  const lang = localeOf(state, input);
+
+  const question = state.questions.find((item) => item.id === input.questionId);
+  if (!question) throw new Error(t.err_unknown_question);
+  if (!project.technologies.some((item) => item.techId === question.techId)) {
+    throw new Error(t.err_quiz_foreign);
+  }
+
+  let grade;
+  let gradedLocally = false;
+  if (allowsGeneration(project.privacy)) {
+    try {
+      grade = await gradeAnswer({
+        paseo: context.paseo,
+        cwd: project.root,
+        provider: state.settings.provider,
+        deferToUserAgents: state.settings.deferToUserAgents,
+        privacy: project.privacy,
+        question: question.prompt,
+        rubric: question.rubric,
+        answer: input.answer,
+        lang,
+      });
+    } catch {
+      grade = gradeLocally(question.rubric, input.answer);
+      gradedLocally = true;
+    }
+  } else {
+    grade = gradeLocally(question.rubric, input.answer);
+    gradedLocally = true;
+  }
+
+  return updateState((current) => {
+    const stored = current.questions.find((item) => item.id === input.questionId);
+    if (!stored) throw new Error(t.err_unknown_question);
+    stored.attempts += 1;
+    const node = current.nodes.find((item) => item.groupId === stored.nodeGroupId);
+    // ⭐ 只有答对才写证据。答错什么都不记 —— 否则反复乱答也能刷出"我学过"
+    if (grade.passed) {
+      stored.passed = true;
+      const createdAt = Date.now();
+      const id = evidenceKey(stored.nodeGroupId, "quiz_passed", stored.id, createdAt);
+      if (!current.evidence.some((item) => item.id === id)) {
+        current.evidence.push({
+          id,
+          nodeGroupId: stored.nodeGroupId,
+          projectId: project.id,
+          kind: "quiz_passed",
+          reference: stored.id,
+          createdAt,
+        });
+      }
+    }
+    return {
+      passed: grade.passed,
+      score: grade.score,
+      feedback: grade.feedback,
+      gradedLocally,
+      mastery: masteryFor(current, stored.nodeGroupId, node?.difficulty ?? 1, Date.now()),
+    };
+  });
+}
+
+// ── Commits ─────────────────────────────────────────────────────────
+
+export async function listCommits(
+  input: ZodOutput<typeof commitsRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  return { commits: await analyzeAndRecord(project, await readState(), input.limit) };
+}
+
+// ── 还债 ────────────────────────────────────────────────────────────
+
+export async function listReviews(
+  input: ZodOutput<typeof reviewsRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  await ingestLiveAgents(context, project, input.workspaceId, "en").catch(() => []);
+  const state = await readState();
+  const now = Date.now();
+  return {
+    reviews: publicReviews(state, project, localeOf(state, input), graspedSet(state, now), now, false),
+  };
+}
+
+/**
+ * 读一处待审阅改动的当前文件内容。
+ *
+ * **只读本地文件，一个字都不外发。** 这是"还债"的主场景：
+ * 用户要真的看到 agent 写了什么才能说自己读懂了。
+ */
+export async function getReviewSource(
+  input: ZodOutput<typeof reviewSourceRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  const state = await readState();
+  const review = state.reviews.find(
+    (item) => item.id === input.reviewId && item.projectId === project.id,
+  );
+  if (!review) return { file: "", available: false, lines: [], anchorLines: [] };
+
+  let content: string;
+  try {
+    content = await readFile(join(project.root, review.file), "utf8");
+  } catch {
+    return { file: review.file, available: false, lines: [], anchorLines: [] };
+  }
+  const anchorLines = project.technologies
+    .flatMap((usage) => usage.evidence)
+    .filter((anchor) => anchor.file === review.file)
+    .map((anchor) => anchor.line);
+  const lines = content.split(/\r?\n/).slice(0, 600).map((text, index) => ({
+    line: index + 1,
+    text: text.slice(0, 400),
+  }));
+  return { file: review.file, available: true, lines, anchorLines };
+}
+
+export async function markReviewDone(
+  input: ZodOutput<typeof markReviewedRpc.input>,
+  context: PluginHandlerContext,
+) {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  const now = Date.now();
+  const paid = await updateState((current) => {
+    const review = current.reviews.find(
+      (item) => item.id === input.reviewId && item.projectId === project.id,
+    );
+    if (!review || review.reviewedAt !== null) return 0;
+    review.reviewedAt = now;
+    const seen = new Set(current.evidence.map((item) => item.id));
+    let count = 0;
+    for (const item of markReviewed(review, now)) {
+      if (seen.has(item.id)) continue;
+      current.evidence.push(item);
+      seen.add(item.id);
+      count += 1;
+    }
+    return count;
+  });
+  const state = await readState();
+  return {
+    reviews: publicReviews(state, project, localeOf(state, input), graspedSet(state, now), now, false),
+    paid,
+  };
+}
+
+// ── Agent 面板 ──────────────────────────────────────────────────────
+
+export async function getAgentImpact(
+  input: ZodOutput<typeof agentImpactRpc.input>,
+  context: PluginHandlerContext,
+): Promise<AgentImpact> {
+  const t = await tFor(input);
+  const project = await ensureProject(input, context, t);
+  const handle = context.paseo.agents.ref(input.agentId);
+  const page = await handle.timeline.refetch({ direction: "tail", limit: 300, projection: "canonical" });
+  if (page.agent?.id !== input.agentId || page.agent.workspaceId !== input.workspaceId) {
+    throw new Error(t.err_agent_foreign);
+  }
+
+  const mutations: Mutation[] = [];
+  for (const entry of page.entries) {
+    const mutation = mutationFrom(entry.item, entry.timestamp, project.root);
+    if (mutation) mutations.push(mutation);
+  }
+
+  let state = await readState();
+  const grasped = graspedSet(state, Date.now());
+  const ingest = ingestMutations({
+    project,
+    nodes: state.nodes,
+    agentId: input.agentId,
+    mutations,
+    grasped,
+    existingObservationIds: new Set(state.observations.map((item) => item.id)),
+    existingReviewIds: new Set(state.reviews.map((item) => item.id)),
+  });
+  if (ingest.observations.length || ingest.reviews.length || ingest.evidence.length) {
+    await updateState((current) => {
+      const observationIds = new Set(current.observations.map((item) => item.id));
+      for (const item of ingest.observations) if (!observationIds.has(item.id)) current.observations.push(item);
+      const reviewIds = new Set(current.reviews.map((item) => item.id));
+      for (const item of ingest.reviews) if (!reviewIds.has(item.id)) current.reviews.push(item);
+      const evidenceIds = new Set(current.evidence.map((item) => item.id));
+      for (const item of ingest.evidence) if (!evidenceIds.has(item.id)) current.evidence.push(item);
+    });
+    state = await readState();
+  }
+
+  const now = Date.now();
+  const lang = localeOf(state, input);
+  const refreshedGrasp = graspedSet(state, now);
+  const files = new Set(mutations.map((item) => item.file));
+  const techName = new Map(state.techs.map((item) => [item.id, item.name]));
+  const touchedTechIds = project.technologies
+    .filter((usage) => usage.evidence.some((anchor) => files.has(anchor.file)))
+    .map((usage) => usage.techId);
+
+  const weakNodes = touchedTechIds
+    .flatMap((techId) => nodesFor(state, techId, lang))
+    .map((node) => publicNode(state, node, techName.get(node.techId) ?? node.techId, refreshedGrasp, now))
+    .filter((node) => !node.mastery.grasped)
+    .slice(0, 30);
+
+  const knownPackages = new Set(
+    project.technologies.flatMap((usage) => usage.packages.map((pkg) => pkg.toLowerCase())),
+  );
+  const verdict = await fastPath({ project, mutations, learned: state.aliases, knownPackages });
+
+  return {
+    agentId: input.agentId,
+    projectName: project.name,
+    bucket: agentBucket(
+      page.agent?.status ?? null,
+      Boolean(page.agent?.requiresAttention),
+      verdict.candidates.length,
+    ),
+    touchedFiles: [...files].slice(-80),
+    touchedTechs: touchedTechIds.map((techId) => techName.get(techId) ?? techId),
+    weakNodes,
+    newKnowledge: verdict.candidates,
+    totalDebt: weakNodes.reduce((sum, node) => sum + node.mastery.debt, 0),
+    reviews: publicReviews(state, project, lang, refreshedGrasp, now, false)
+      .filter((review) => review.agentId === input.agentId),
+  };
+}
+
+// ── 全局 ────────────────────────────────────────────────────────────
+
+export async function overview(input: ZodOutput<typeof overviewRpc.input>) {
+  const state = await readState();
+  const lang = localeOf(state, input);
+  const now = Date.now();
+  const grasped = graspedSet(state, now);
+  const techName = new Map(state.techs.map((item) => [item.id, item.name]));
+  const allNodes = state.nodes
+    .filter((node) => node.lang === lang || !state.nodes.some((other) => other.groupId === node.groupId && other.lang === lang))
+    .map((node) => publicNode(state, node, techName.get(node.techId) ?? node.techId, grasped, now));
+  const uniqueTech = new Set(state.projects.flatMap((project) => project.technologies.map((item) => item.techId)));
+  return {
+    projects: state.projects.map((project) => projectSummary(state, project, lang, grasped, now)),
     totalTechnologies: uniqueTech.size,
     totalNodes: allNodes.length,
     graspedNodes: allNodes.filter((node) => node.mastery.grasped).length,
     totalDebt: allNodes.reduce((sum, node) => sum + node.mastery.debt, 0),
+    unreviewedCount: state.reviews.filter((review) => review.reviewedAt === null).length,
+    locale: lang,
   };
 }
 
+// ── 设置 ────────────────────────────────────────────────────────────
+
+async function settingsView(
+  state: RumenState,
+  input: LocaleInput,
+  context: PluginHandlerContext,
+): Promise<Settings> {
+  const providers = await listGenerationProviders(context.paseo).catch(() => []);
+  return {
+    locale: state.settings.locale,
+    resolvedLocale: localeOf(state, input),
+    lockedByEnv: LOCALES.some(
+      (locale) => (process.env.RUMEN_LANG ?? "").toLowerCase().startsWith(locale),
+    ),
+    provider: state.settings.provider,
+    availableProviders: providers,
+    deferToUserAgents: state.settings.deferToUserAgents,
+  };
+}
+
+export async function getSettings(
+  input: ZodOutput<typeof settingsRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Settings> {
+  return settingsView(await readState(), input, context);
+}
+
+export async function updateSettings(
+  input: ZodOutput<typeof updateSettingsRpc.input>,
+  context: PluginHandlerContext,
+): Promise<Settings> {
+  const state = await updateState((current) => {
+    if (input.locale !== undefined) current.settings.locale = input.locale;
+    if (input.provider !== undefined) current.settings.provider = input.provider;
+    if (input.deferToUserAgents !== undefined) current.settings.deferToUserAgents = input.deferToUserAgents;
+    return structuredClone(current);
+  });
+  return settingsView(state, input, context);
+}
+
+// ── 导出 ────────────────────────────────────────────────────────────
+
 export async function exportKnowledge(_input: ZodOutput<typeof exportRpc.input>) {
   const state = await readState();
+  const now = Date.now();
+  const { mkdir, writeFile } = await import("node:fs/promises");
   const directory = join(dataDirectory(), "export");
   await mkdir(directory, { recursive: true, mode: 0o700 });
+
   const records: unknown[] = [];
-  for (const node of state.nodes) records.push({ type: "node", ...node, mastery: masteryForNode(state, node.id) });
-  for (const evidence of state.evidence) records.push({ type: "evidence", id: evidence.id, nodeId: evidence.nodeId, project: evidence.projectId ? stableHash(evidence.projectId) : null, kind: evidence.kind, createdAt: evidence.createdAt });
-  for (const wiki of state.wikis) records.push({ type: "wiki", project: stableHash(wiki.projectId), techId: wiki.techId, title: wiki.title, body: wiki.body, generatedAt: wiki.generatedAt, sourceCount: wiki.sourceCount, sourcedRatio: wiki.sourcedRatio });
+  for (const node of state.nodes) {
+    records.push({
+      type: "node",
+      groupId: node.groupId,
+      techId: node.techId,
+      lang: node.lang,
+      title: node.title,
+      summary: node.summary,
+      difficulty: node.difficulty,
+      prerequisites: node.prerequisites,
+      origin: node.origin,
+      mastery: masteryFor(state, node.groupId, node.difficulty, now),
+    });
+  }
+  for (const item of state.evidence) {
+    records.push({
+      type: "evidence",
+      id: item.id,
+      nodeGroupId: item.nodeGroupId,
+      // ⭐ 项目身份哈希掉：导出里不该出现项目名、路径或 remote
+      project: item.projectId ? stableHash(item.projectId) : null,
+      kind: item.kind,
+      createdAt: item.createdAt,
+    });
+  }
+  for (const wiki of state.wikis) {
+    records.push({
+      type: "wiki",
+      techId: wiki.techId,
+      majorVersion: wiki.majorVersion,
+      lang: wiki.lang,
+      title: wiki.title,
+      summary: wiki.summary,
+      sections: wiki.sections,
+      sources: wiki.sources,
+      generatedAt: wiki.generatedAt,
+      sourcedRatio: wiki.sourcedRatio,
+    });
+  }
   records.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
   const path = join(directory, "rumen.jsonl");
-  await writeFile(path, `${records.map((item) => JSON.stringify(item)).join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+  await writeFile(path, `${records.map((item) => JSON.stringify(item)).join("\n")}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   return { path, records: records.length };
 }
 
+// ── 附件源 ──────────────────────────────────────────────────────────
+
 export async function searchAttachments(input: ZodOutput<typeof attachmentSearchRpc.input>) {
   const state = await readState();
+  const now = Date.now();
   const query = input.query.trim().toLowerCase();
-  const items: Array<{ id: string; identifier: string; title: string; subtitle?: string; url: string; text: string; resourceType: string }> = [];
+  const techName = new Map(state.techs.map((item) => [item.id, item.name]));
+  const items: Array<{
+    id: string;
+    identifier: string;
+    title: string;
+    subtitle?: string;
+    url: string;
+    text: string;
+    resourceType: string;
+  }> = [];
+
   for (const node of state.nodes) {
-    const technology = state.projects.flatMap((project) => project.technologies).find((item) => item.id === node.techId);
-    const haystack = `${technology?.name ?? ""} ${node.title} ${node.summary}`.toLowerCase();
+    const name = techName.get(node.techId) ?? node.techId;
+    const haystack = `${name} ${node.title} ${node.summary}`.toLowerCase();
     if (query && !haystack.includes(query)) continue;
-    const mastery = masteryForNode(state, node.id);
+    const mastery = masteryFor(state, node.groupId, node.difficulty, now);
     items.push({
       id: node.id,
-      identifier: node.id,
+      identifier: node.groupId,
       title: node.title,
-      subtitle: `${technology?.name ?? node.techId} · mastery ${Math.round(mastery.score)} · debt ${mastery.debt}`,
-      url: `rumen://knowledge/${encodeURIComponent(node.id)}`,
-      text: `# ${node.title}\n\n${node.summary}\n\nCurrent mastery: ${Math.round(mastery.score)}/100; confidence ${Math.round(mastery.confidence * 100)}%; knowledge debt ${mastery.debt}.\n\nUse this as learning context. Do not claim the user understands concepts without positive evidence.`,
+      subtitle: `${name} · ${Math.round(mastery.score)}/100 · debt ${mastery.debt}`,
+      url: `rumen://knowledge/${encodeURIComponent(node.groupId)}`,
+      text: `# ${node.title}\n\n${node.summary}\n\nCurrent mastery: ${
+        Math.round(mastery.score)
+      }/100; confidence ${Math.round(mastery.confidence * 100)}%; knowledge debt ${mastery.debt}.\n\nUse this as learning context. Do not claim the user understands concepts without positive evidence.`,
       resourceType: "rumen-knowledge",
     });
     if (items.length >= 50) break;
   }
   return { items };
+}
+
+// ── 错误文案 ────────────────────────────────────────────────────────
+
+function describeGenerationError(error: unknown, t: Translator): string {
+  if (error instanceof GenerationBusyError) return t.err_generation_busy;
+  if (error instanceof NoProviderError) return t.err_no_provider;
+  if (error instanceof Error && error.name === "GenerationInvalidError") return t.err_generation_invalid;
+  return t.err_generation_failed(error instanceof Error ? error.message : String(error));
 }
