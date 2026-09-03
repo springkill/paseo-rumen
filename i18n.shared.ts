@@ -426,10 +426,13 @@ const CATALOG = {
     zh: "Paseo 里没有可用的 provider",
     en: "No provider is available in Paseo",
   },
-  settings_defer_to_user: { zh: "你的 agent 在跑时让路", en: "Yield while your own agents run" },
+  settings_defer_to_user: {
+    zh: "后台分析给你的 agent 让路",
+    en: "Background analysis yields to your agents",
+  },
   settings_defer_detail: {
-    zh: "你正在被 agent 服务时不跟你抢配额，也避免触发限流",
-    en: "Does not compete for quota or trigger rate limits while an agent is working for you",
+    zh: "只影响 Rumen 自己发起的后台分析。你点按钮触发的生成不受影响 —— 你正是为了这件事才点的",
+    en: "Only affects analysis Rumen starts on its own. Generation you trigger by clicking is never held back",
   },
 
   settings_data: { zh: "本地数据", en: "Local data" },
@@ -537,8 +540,8 @@ const CATALOG = {
     en: `Generation failed: ${detail}`,
   }),
   err_generation_busy: {
-    zh: "你的 agent 正在跑，生成已让路。等它跑完再试",
-    en: "Your own agent is running, so generation yielded. Try again once it finishes",
+    zh: "你的 agent 正在跑，这项后台分析已让路。等它跑完会自动再来",
+    en: "Your own agent is running, so this background analysis yielded. It will retry once that finishes",
   },
   err_generation_invalid: {
     zh: "agent 返回的内容无法校验 —— 已丢弃，没有落库",

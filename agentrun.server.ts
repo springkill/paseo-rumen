@@ -203,6 +203,19 @@ export interface RunOptions<T> {
   timeoutMs: number;
   /** 校验 + 回指校验。抛错就重试。 */
   validate: (value: unknown) => T;
+  /**
+   * 谁发起的。
+   *
+   * ⭐ **只有 `background` 才给用户的 agent 让路。**
+   *
+   * 原则是"你正在被 agent 服务时，后台分析不该跟你抢配额"。但用户**刚点下去的
+   * 按钮**不是后台分析 —— 他正是为了这件事才点的，给它让路等于永远不干活。
+   *
+   * 实机上这条判错了会直接废掉整个功能：Paseo 的常态就是有 agent 在跑
+   * （用户往往就是从一个 agent 会话里切过来点的按钮），于是每次点生成都收到
+   * "你的 agent 正在跑，生成已让路"，而且怎么归档都没用 —— 挡路的是别的会话。
+   */
+  initiator: "user" | "background";
   deferToUserAgents: boolean;
   retries?: number;
   /** 用来生成落盘路径，同时也是这次运行的 id。 */
@@ -227,7 +240,8 @@ async function readOutputFile(path: string): Promise<unknown | null> {
 }
 
 export async function runStructured<T>(options: RunOptions<T>): Promise<RunResult<T>> {
-  if (options.deferToUserAgents && await userAgentsBusy(options.paseo)) {
+  const shouldYield = options.initiator === "background" && options.deferToUserAgents;
+  if (shouldYield && await userAgentsBusy(options.paseo)) {
     throw new GenerationBusyError();
   }
   const provider = await resolveProvider(options.paseo, options.provider);

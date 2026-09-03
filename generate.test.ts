@@ -95,6 +95,7 @@ function createdAgents(paseo: PaseoApi): number {
 const RUN_BASE = {
   task: "test",
   runId: "test-run",
+  initiator: "background" as const,
   prompt: "p",
   schema: {},
   cwd: "/tmp",
@@ -103,11 +104,23 @@ const RUN_BASE = {
   deferToUserAgents: true,
 };
 
-test("用户的 agent 在跑时让路，不跟他抢配额", async () => {
+test("后台分析给用户的 agent 让路，不跟他抢配额", async () => {
   await assert.rejects(
     () => runStructured({ ...RUN_BASE, paseo: fakePaseo(['{"ok":1}'], { running: true }), validate: (v) => v }),
     GenerationBusyError,
   );
+});
+
+test("⭐ 用户点出来的动作**不**让路 —— 他正是为了这件事才点的", async () => {
+  // Paseo 的常态就是有 agent 在跑（用户往往就是从一个 agent 会话里切过来点的按钮）。
+  // 让路会让每一次点击都收到"已让路"，而且怎么归档都没用 —— 挡路的是别的会话
+  const result = await runStructured({
+    ...RUN_BASE,
+    initiator: "user",
+    paseo: fakePaseo(['{"ok":1}'], { running: true }),
+    validate: (value) => value as { ok: number },
+  });
+  assert.deepEqual(result.value, { ok: 1 });
 });
 
 test("校验不过就重试，重试完还不过就丢弃 —— 不落库", async () => {

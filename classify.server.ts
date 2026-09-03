@@ -97,6 +97,8 @@ export async function classifyPending(input: {
   cwd: string;
   provider: string | null;
   deferToUserAgents: boolean;
+  /** 默认 `user` —— 目前所有生成都是用户点按钮触发的。 */
+  initiator?: "user" | "background";
   pending: readonly PendingPackage[];
   now?: number;
   runId: string;
@@ -119,7 +121,8 @@ export async function classifyPending(input: {
       cwd: input.cwd,
       provider: input.provider,
       timeoutMs: 300_000,
-      deferToUserAgents: input.deferToUserAgents,
+      initiator: input.initiator ?? "user",
+    deferToUserAgents: input.deferToUserAgents,
       validate(value) {
         const record = value as { classifications?: unknown };
         if (!Array.isArray(record.classifications)) throw new Error("missing classifications array");

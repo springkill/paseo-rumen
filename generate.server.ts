@@ -186,6 +186,8 @@ export async function generateWiki(input: {
   cwd: string;
   provider: string | null;
   deferToUserAgents: boolean;
+  /** 默认 `user` —— 目前所有生成都是用户点按钮触发的。 */
+  initiator?: "user" | "background";
   privacy: Privacy;
   techId: string;
   techName: string;
@@ -210,6 +212,7 @@ export async function generateWiki(input: {
     cwd: input.cwd,
     provider: input.provider,
     timeoutMs: WIKI_TIMEOUT_MS,
+    initiator: input.initiator ?? "user",
     deferToUserAgents: input.deferToUserAgents,
     validate(value) {
       const doc = value as Partial<RawWiki>;
@@ -372,6 +375,8 @@ export async function generateQuestion(input: {
   cwd: string;
   provider: string | null;
   deferToUserAgents: boolean;
+  /** 默认 `user` —— 目前所有生成都是用户点按钮触发的。 */
+  initiator?: "user" | "background";
   privacy: Privacy;
   techName: string;
   nodeTitle: string;
@@ -425,6 +430,7 @@ Return only the JSON object.`;
     cwd: input.cwd,
     provider: input.provider,
     timeoutMs: QUIZ_TIMEOUT_MS,
+    initiator: input.initiator ?? "user",
     deferToUserAgents: input.deferToUserAgents,
     validate(value) {
       const item = value as { prompt?: unknown; rubric?: unknown };
@@ -468,6 +474,8 @@ export async function gradeAnswer(input: {
   cwd: string;
   provider: string | null;
   deferToUserAgents: boolean;
+  /** 默认 `user` —— 目前所有生成都是用户点按钮触发的。 */
+  initiator?: "user" | "background";
   privacy: Privacy;
   question: string;
   rubric: readonly string[];
@@ -508,6 +516,7 @@ Return only the JSON object.`;
     cwd: input.cwd,
     provider: input.provider,
     timeoutMs: QUIZ_TIMEOUT_MS,
+    initiator: input.initiator ?? "user",
     deferToUserAgents: input.deferToUserAgents,
     retries: 1,
     validate(value) {
