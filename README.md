@@ -144,6 +144,39 @@ RUMEN_LANG > 设置页上的选择 > 客户端语言 > 宿主机 LC_ALL/LC_MESSA
 
 ---
 
+## 安装
+
+```bash
+paseo plugin install https://github.com/springkill/paseo-rumen
+```
+
+钉版本、追更新：
+
+```bash
+paseo plugin install https://github.com/springkill/paseo-rumen --ref v0.2.0
+paseo plugin status              # 有没有新版
+paseo plugin update paseo-rumen
+```
+
+卸载：`paseo plugin remove paseo-rumen`（本地知识状态留在
+`$PASEO_HOME/plugin-data/paseo-rumen/`，不会被删）
+
+**不需要 `npm install`。** Paseo 自己用 esbuild 编译插件，SDK / `react` /
+`react-native` / `zod` / `@tanstack/react-query` 都由宿主提供；本插件除此之外
+只用 Node 内置模块。
+
+### ⚠️ 安装前请知道
+
+Paseo 的插件是**受信任、不沙箱**的。就 Rumen 而言这意味着：
+
+- **后端代码在你的机器上以你的身份运行**
+- 它会**读你绑定项目里的源码**（扫描技术栈、读 agent 改过的文件给你审阅）
+- 生成 Wiki / 检验题会**调用你在 Paseo 里配好的 provider，消耗你自己的额度**
+- 项目隐私默认 `private`：只有技术栈名和依赖名会离开本机；
+  `airgapped` 则完全不调 agent。详见上面的「隐私」一节
+
+装任何第三方插件都等于信任它的作者。先看代码，或用 `--ref` 钉到你审过的 commit。
+
 ## 开发
 
 ```bash
@@ -151,7 +184,7 @@ npm install
 npm run typecheck
 npm test
 
-paseo plugin install /absolute/path/to/paseo-rumen
+paseo plugin install "$(pwd)"        # 按目录装
 paseo plugin reload paseo-rumen      # 改完源码只 reload，不重启 Paseo
 paseo plugin logs paseo-rumen
 ```
@@ -160,12 +193,16 @@ paseo plugin logs paseo-rumen
 
 ### 状态迁移
 
-v1 → v2 会**丢弃 v1 的技术栈和知识点数据**，只保留项目身份与隐私级别，
-并把原文件另存为 `state.json.v1-<timestamp>`。
+当前 schema 版本 **v3**。每次迁移都会把原文件另存为
+`state.json.v<旧版本>-<timestamp>`，不删。
 
-原因：v1 让每个未命中的包各自成一个 TechEntity，实测一个 workspace 扫出
-**2293 个「技术栈」、6945 个知识点、7.8MB 状态文件**；挂在这些伪知识点上的证据
-指向的东西根本不存在。迁移过来等于把坏数据带进新 schema。迁移后重扫即可。
+- **v1 → v3**：丢弃 v1 的技术栈和知识点数据，只保留项目身份与隐私级别。
+  原因：v1 让每个未命中的包各自成一个 TechEntity，实测一个 workspace 扫出
+  **2293 个「技术栈」、6945 个知识点、7.8MB 状态文件**；挂在这些伪知识点上的
+  证据指向的东西根本不存在。迁移过来等于把坏数据带进新 schema。迁移后重扫即可
+- **v2 → v3**：项目名从目录名重算。v2 存的是 workspace 的**会话标题**
+  （agent 从对话内容生成的），于是项目列表显示成
+  "Explore naruto codebase" 这种东西
 
 ---
 
