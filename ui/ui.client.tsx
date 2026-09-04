@@ -22,7 +22,7 @@
 import { Icon, type PluginTheme, useRpc } from "@getpaseo/plugin";
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, NativeModules, Pressable, Text, View } from "react-native";
 import { settingsRpc, type Settings } from "../domain/contracts.shared";
 import { bucketStyle, masteryColor, type StatusBucket } from "../domain/buckets.shared";
 import { translator, type Locale, type Translator } from "../domain/i18n.shared";
@@ -30,24 +30,51 @@ import { translator, type Locale, type Translator } from "../domain/i18n.shared"
 // ── 语言 ────────────────────────────────────────────────────────────
 
 /**
- * 客户端的语言。
+ * 客户端自己是什么语言 —— **对齐 Paseo 自己的取法**。
  *
- * ⭐ Paseo 可以从手机或浏览器访问，那时**看界面的人和跑 daemon 的机器不是同一个**。
- * 所以把客户端检测到的语言当成一个信号送给服务端，由服务端按统一的优先级裁决
- * （`RUMEN_LANG` > 用户设置 > 这个 > 宿主机环境 > en）。
+ * Paseo 的原逻辑（web-ui bundle 里读出来的）：
  *
- * 判定本身仍然只有一处 —— 在服务端。这里只负责"报告我这边是什么语言"。
+ * ```js
+ * isWeb && navigator.languages.length > 0
+ *   ? [...navigator.languages]              // web：浏览器语言列表
+ *   : getLocales().map(e => e.languageTag)  // 原生：expo-localization 取系统 locale
+ * ```
+ *
+ * 插件拿不到 `expo-localization`（它不在宿主提供的 external 列表里），
+ * 所以原生那半边用 `react-native` 的 `NativeModules` 取同一个系统值，
+ * 最后再退到 `Intl`。顺序刻意与 Paseo 一致，免得同一台机器上
+ * Paseo 显示一种语言、插件显示另一种。
+ *
+ * ⚠️ 只负责**报告**，判定在服务端 —— 两边各判一次必然判出不一样的结果。
  */
 export function detectClientLocale(): string | undefined {
+  // ① web：与 Paseo 完全同源
   try {
     const globals = globalThis as unknown as {
       navigator?: { language?: string; languages?: readonly string[] };
     };
-    const fromNavigator = globals.navigator?.languages?.[0] ?? globals.navigator?.language;
-    if (fromNavigator) return fromNavigator;
+    const languages = globals.navigator?.languages;
+    if (languages && languages.length > 0) return languages[0];
+    if (globals.navigator?.language) return globals.navigator.language;
   } catch {
     // 沙箱里可能没有 navigator
   }
+
+  // ② 原生：expo-localization 读的就是这两个系统值
+  try {
+    const modules = (NativeModules ?? {}) as Record<string, Record<string, unknown> | undefined>;
+    const ios = modules.SettingsManager?.settings as
+      | { AppleLocale?: string; AppleLanguages?: string[] }
+      | undefined;
+    const fromIos = ios?.AppleLocale ?? ios?.AppleLanguages?.[0];
+    if (typeof fromIos === "string" && fromIos) return fromIos;
+    const android = modules.I18nManager?.localeIdentifier;
+    if (typeof android === "string" && android) return android;
+  } catch {
+    // 非原生环境没有 NativeModules
+  }
+
+  // ③ 兜底
   try {
     return new Intl.DateTimeFormat().resolvedOptions().locale;
   } catch {
