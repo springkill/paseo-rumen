@@ -21,64 +21,20 @@
  * agent、要花钱。**界面是 en 而内容只有 zh 是预期行为，不是 bug。**
  */
 
-export const LOCALES = ["zh", "en"] as const;
-export type Locale = (typeof LOCALES)[number];
+// 语言判定与 catalog 机制在 locale.shared.ts —— 三个插件同一套。
+// 这里只负责本插件的文案内容。
+export {
+  LOCALE_NATIVE_NAME,
+  LOCALES,
+  localeFromTag,
+  lockedByEnv,
+  resolveLocale,
+  type Locale,
+  type LocalePreference,
+} from "./locale.shared";
 
-/** 每条文案必须给全所有语言，缺一个就编译不过。 */
-type Message = { readonly [L in Locale]: string };
-type Entry = Message | ((...args: never[]) => Message);
-type Catalog = Readonly<Record<string, Entry>>;
-
-/**
- * 解析 BCP-47 / POSIX 风格的语言标签。
- *
- * `zh_CN.UTF-8`、`zh-Hans`、`zh`、`en_US` 都认。
- * `C` / `POSIX` 不是语言 —— 它们等同于「没设置」，返回 null 让上游继续往下找。
- */
-export function localeFromTag(tag: string | null | undefined): Locale | null {
-  if (!tag) return null;
-  const head = tag.split(/[.@]/)[0]?.replace(/_/g, "-").toLowerCase();
-  const language = head?.split("-")[0];
-  if (language === "zh") return "zh";
-  if (language === "en") return "en";
-  return null;
-}
-
-/**
- * 界面语言判定。
- *
- * 优先级：`RUMEN_LANG` > 用户设置 > 客户端语言 > 宿主机 `LC_ALL`/`LC_MESSAGES`/`LANG` > 英文。
- *
- * ⭐ **用户设置压过环境变量，但压不过 `RUMEN_LANG`。**
- * `LANG` 是环境在*告诉*我们这台机器习惯什么语言 —— 那是推断；
- * 设置页上点出来的是用户的*决定*。推断不该盖过决定，否则用户把界面设成英文，
- * 换个终端又变回中文，而他找不到是谁改的。`RUMEN_LANG` 同样显式，
- * 且只作用于这一个进程（作用域更窄），所以排在最前。
- *
- * ⭐ **客户端语言排在宿主机环境之前。** Paseo 可以从手机或浏览器访问，
- * 那时看界面的人和跑 daemon 的机器不是同一个。谁在看就跟谁走。
- *
- * 认不出来一律退到英文 —— 对一个国际化的工具，
- * 「认不出来就说英文」比「认不出来就说中文」更不容易让人卡住。
- */
-export function resolveLocale(input: {
-  env?: Record<string, string | undefined>;
-  saved?: string | null;
-  clientHint?: string | null;
-}): Locale {
-  const env = input.env ?? {};
-  const forced = localeFromTag(env.RUMEN_LANG);
-  if (forced) return forced;
-  const saved = localeFromTag(input.saved);
-  if (saved) return saved;
-  const hinted = localeFromTag(input.clientHint);
-  if (hinted) return hinted;
-  for (const key of ["LC_ALL", "LC_MESSAGES", "LANG"]) {
-    const fromEnv = localeFromTag(env[key]);
-    if (fromEnv) return fromEnv;
-  }
-  return "en";
-}
+import { makeTranslator, type Catalog, type Locale } from "./locale.shared";
+import type { Translated } from "./locale.shared";
 
 /**
  * 文案表。
@@ -563,12 +519,6 @@ export type MessageKey = keyof typeof CATALOG;
 /** 全部文案的名字。测试用它遍历，也便于外部工具盘点。 */
 export const MESSAGE_KEYS = Object.keys(CATALOG) as MessageKey[];
 
-type Translated<T> = {
-  readonly [K in keyof T]: T[K] extends (...args: infer A) => Message
-    ? (...args: A) => string
-    : string;
-};
-
 export type Translator = Translated<typeof CATALOG>;
 
 const CACHE = new Map<Locale, Translator>();
@@ -582,19 +532,10 @@ const CACHE = new Map<Locale, Translator>();
 export function translator(locale: Locale): Translator {
   const cached = CACHE.get(locale);
   if (cached) return cached;
-  const out: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(CATALOG)) {
-    out[key] = typeof entry === "function"
-      ? (...args: never[]) => (entry as (...a: never[]) => Message)(...args)[locale]
-      : entry[locale];
-  }
-  const built = Object.freeze(out) as Translator;
+  const built = makeTranslator(CATALOG, locale);
   CACHE.set(locale, built);
   return built;
 }
-
-/** 语言自己的名字，用在语言选择器上（永远显示母语名，不翻译）。 */
-export const LOCALE_NATIVE_NAME: Record<Locale, string> = { zh: "中文", en: "English" };
 
 /** 相对时间。`now` 显式传入，方便测试。 */
 export function relativeTime(t: Translator, at: number, now: number): string {

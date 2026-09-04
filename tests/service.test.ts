@@ -86,15 +86,23 @@ function contextFor(workspaceId: string, directory: string, agentId = "agent-1")
 async function withStore<T>(run: (data: string) => Promise<T>): Promise<T> {
   const data = await mkdtemp(join(tmpdir(), "paseo-rumen-data-"));
   process.env.RUMEN_DATA_DIR = data;
+  // ⚠️ 共享语言设置写在 $PASEO_HOME 下，是**三个插件共用的真实文件**。
+  // 不隔离的话测试会把用户设的语言改掉 —— 实测发生过一次
+  const paseoHome = await mkdtemp(join(tmpdir(), "paseo-rumen-home-"));
+  const previousHome = process.env.PASEO_HOME;
+  process.env.PASEO_HOME = paseoHome;
   resetStoreForTests();
   resetCommitCacheForTests();
   try {
     return await run(data);
   } finally {
     delete process.env.RUMEN_DATA_DIR;
+    if (previousHome === undefined) delete process.env.PASEO_HOME;
+    else process.env.PASEO_HOME = previousHome;
     resetStoreForTests();
     resetCommitCacheForTests();
     await rm(data, { recursive: true, force: true });
+    await rm(paseoHome, { recursive: true, force: true });
   }
 }
 
@@ -481,6 +489,33 @@ test("项目名不能是 workspace 的会话标题", async () => {
 });
 
 // ── 语言 ────────────────────────────────────────────────────────────
+
+test("⭐ 语言设置写的是三个插件共用的那个文件", async () => {
+  await withStore(async () => {
+    const root = await mkdtemp(join(tmpdir(), "paseo-rumen-shared-"));
+    try {
+      await writeFile(join(root, "package.json"), JSON.stringify({ dependencies: { react: "^19.0.0" } }));
+      const context = contextFor("workspace-1", root);
+      const { sharedLocalePath } = await import("../server/locale.server");
+
+      await updateSettings({ locale: "zh" }, context);
+
+      // 落点必须在 $PASEO_HOME 下，不是本插件的 plugin-data —— 否则别的插件读不到
+      const path = sharedLocalePath();
+      assert.ok(path.startsWith(process.env.PASEO_HOME!), `共享文件应在 PASEO_HOME 下，实际 ${path}`);
+      assert.ok(!path.includes("plugin-data"), "不能写进本插件的私有目录");
+      assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { locale: "zh" });
+
+      // 模拟"另一个插件改了语言"：直接改文件，rumen 下次请求就该跟上
+      await writeFile(path, JSON.stringify({ locale: "en" }), "utf8");
+      const after = await getSettings({}, context);
+      assert.equal(after.locale, "en", "别的插件改完，这边下次请求要跟上");
+      assert.equal(after.resolvedLocale, "en");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 test("设置里的语言压过环境，且服务端错误跟着走", async () => {
   await withStore(async () => {

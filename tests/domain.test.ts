@@ -15,7 +15,7 @@ import {
   projectIdentity,
   refineAttribution,
 } from "../domain/domain.shared";
-import { LOCALES, localeFromTag, MESSAGE_KEYS, relativeTime, resolveLocale, translator } from "../domain/i18n.shared";
+import { LOCALES, localeFromTag, lockedByEnv, MESSAGE_KEYS, relativeTime, resolveLocale, translator } from "../domain/i18n.shared";
 import { assertNoProjectLeak, PrivacyLeakError, stripPaths } from "../domain/privacy.shared";
 import { resolveTech, TECH_DEFS } from "../domain/techmap.shared";
 
@@ -327,14 +327,50 @@ test("语言标签解析认 POSIX 和 BCP-47", () => {
   assert.equal(localeFromTag(undefined), null);
 });
 
-test("用户的显式选择压过环境推断，但压不过 RUMEN_LANG", () => {
+test("语言判定的优先级链", () => {
   const env = { LANG: "zh_CN.UTF-8" };
-  assert.equal(resolveLocale({ env }), "zh", "没有别的信号时跟随环境");
-  assert.equal(resolveLocale({ env, saved: "en" }), "en", "设置页上点出来的是决定，环境只是推断");
-  assert.equal(resolveLocale({ env: { ...env, RUMEN_LANG: "en" }, saved: "zh" }), "en");
-  assert.equal(resolveLocale({ env: {}, clientHint: "zh-CN" }), "zh", "看界面的人和跑 daemon 的机器可能不是同一个");
-  assert.equal(resolveLocale({ env: { LANG: "zh_CN" }, clientHint: "en-US" }), "en", "客户端语言排在宿主机之前");
-  assert.equal(resolveLocale({ env: {} }), "en", "认不出来退到英文");
+  const K = { envKey: "RUMEN_LANG" };
+
+  assert.equal(resolveLocale({ env, ...K }), "zh", "没有别的信号时跟随宿主机环境");
+  assert.equal(
+    resolveLocale({ env, ...K, saved: "en" }),
+    "en",
+    "设置里点出来的是决定，LANG 只是推断 —— 推断不该盖过决定",
+  );
+  assert.equal(
+    resolveLocale({ env: { ...env, RUMEN_LANG: "en" }, ...K, saved: "zh" }),
+    "en",
+    "插件专属环境变量作用域最窄，压过一切",
+  );
+  assert.equal(
+    resolveLocale({ env: { ...env, PASEO_PLUGIN_LANG: "en" }, ...K, saved: "zh" }),
+    "en",
+    "跨插件环境变量也压过设置",
+  );
+  assert.equal(
+    resolveLocale({ env: { RUMEN_LANG: "zh", PASEO_PLUGIN_LANG: "en" }, ...K }),
+    "zh",
+    "插件专属压过跨插件 —— 作用域窄的优先",
+  );
+  assert.equal(
+    resolveLocale({ env: {}, ...K, clientHint: "zh-CN" }),
+    "zh",
+    "看界面的人和跑 daemon 的机器可能不是同一个",
+  );
+  assert.equal(
+    resolveLocale({ env: { LANG: "zh_CN" }, ...K, clientHint: "en-US" }),
+    "en",
+    "客户端语言排在宿主机之前",
+  );
+  assert.equal(resolveLocale({ env: {}, ...K }), "en", "认不出来退到英文");
+  assert.equal(resolveLocale({ env, ...K, saved: "auto" }), "zh", "auto 不算决定，继续往下找");
+});
+
+test("环境变量锁死时设置项无效，UI 要能说明", () => {
+  assert.equal(lockedByEnv({}, "RUMEN_LANG"), false);
+  assert.equal(lockedByEnv({ RUMEN_LANG: "zh" }, "RUMEN_LANG"), true);
+  assert.equal(lockedByEnv({ PASEO_PLUGIN_LANG: "en" }, "RUMEN_LANG"), true);
+  assert.equal(lockedByEnv({ RUMEN_LANG: "fr" }, "RUMEN_LANG"), false, "认不出的语言不算锁定");
 });
 
 test("每条文案都给全了所有语言", () => {

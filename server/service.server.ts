@@ -69,7 +69,7 @@ import {
   WIKI_SCHEMA_VERSION,
 } from "./generate.server";
 import {
-  LOCALES,
+  lockedByEnv,
   resolveLocale,
   translator,
   type Locale,
@@ -78,6 +78,7 @@ import {
 import { fastPath, ingestMutations, markReviewed, mutationFrom, verdictBucket, type Mutation } from "./observe.server";
 import { allowsGeneration, allowsProjectCode } from "../domain/privacy.shared";
 import { identifyProject, resolveProjectRoot, ScanBoundaryError, scanWorkspace } from "./scanner.server";
+import { refreshSharedLocale, setSharedLocale, sharedLocalePreference } from "./locale.server";
 import {
   dataDirectory,
   readState,
@@ -98,16 +99,42 @@ type WorkspaceInput = LocaleInput & {
 
 // ── 语言 ────────────────────────────────────────────────────────────
 
-function localeOf(state: RumenState, input: LocaleInput): Locale {
+/**
+ * 界面语言。
+ *
+ * ⭐ 偏好来自**三个 Paseo 插件共用的那个文件**，不是本插件的私有状态 ——
+ * 否则用户装了三个插件就得设三次，那不叫"和 Paseo 统一"。
+ */
+function localeOf(input: LocaleInput): Locale {
   return resolveLocale({
     env: process.env,
-    saved: state.settings.locale === "auto" ? null : state.settings.locale,
+    envKey: "RUMEN_LANG",
+    saved: sharedLocalePreference(),
     clientHint: input.clientLocale ?? null,
   });
 }
 
+/** 每个 handler 的入口。顺手把共享语言刷一遍，别的插件改过就跟上。 */
 async function tFor(input: LocaleInput): Promise<Translator> {
-  return translator(localeOf(await readState(), input));
+  await refreshSharedLocale();
+  await migrateLegacyLocaleOnce();
+  return translator(localeOf(input));
+}
+
+/**
+ * 一次性：把 v3 存在本插件状态里的语言搬进共享文件。
+ *
+ * 只在共享文件还没设过（`auto`）时搬 —— 否则会把用户在别的插件里刚设的值
+ * 覆盖回 rumen 的旧值。
+ */
+let migrated = false;
+async function migrateLegacyLocaleOnce(): Promise<void> {
+  if (migrated) return;
+  migrated = true;
+  if (sharedLocalePreference() !== "auto") return;
+  const legacy = (await readState()).settings.locale;
+  if (legacy === "auto") return;
+  await setSharedLocale(legacy);
 }
 
 // ── workspace 校验 ──────────────────────────────────────────────────
@@ -264,7 +291,7 @@ async function ensureProject(
         current.techs.push(tech);
         known.add(tech.id);
       }
-      ensureFallbackNodes(current, project, localeOf(current, input));
+      ensureFallbackNodes(current, project, localeOf(input));
     }
     return structuredClone(project);
   });
@@ -303,7 +330,7 @@ async function rescan(
       current.techs.push(tech);
       known.add(tech.id);
     }
-    ensureFallbackNodes(current, project, localeOf(current, input));
+    ensureFallbackNodes(current, project, localeOf(input));
     return structuredClone(project);
   });
 }
@@ -629,7 +656,7 @@ async function dashboardFor(
 ): Promise<Dashboard> {
   const liveAgents = await ingestLiveAgents(context, project, input.workspaceId).catch(() => []);
   const state = await readState();
-  const lang = localeOf(state, input);
+  const lang = localeOf(input);
   const now = Date.now();
   const stored = state.projects.find((item) => item.id === project.id) ?? project;
   const grasped = graspedSet(state, now);
@@ -799,7 +826,7 @@ export async function setPrivacy(
     if (!stored) throw new Error(t.err_workspace_unavailable);
     stored.privacy = input.privacy;
     const now = Date.now();
-    return projectSummary(current, stored, localeOf(current, input), graspedSet(current, now), now, input.workspaceId);
+    return projectSummary(current, stored, localeOf(input), graspedSet(current, now), now, input.workspaceId);
   });
 }
 
@@ -873,7 +900,7 @@ export async function getWiki(
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
   const state = await readState();
-  return projectWiki(state, project, input.techId, input.lang ?? localeOf(state, input));
+  return projectWiki(state, project, input.techId, input.lang ?? localeOf(input));
 }
 
 export async function generateWikiFor(
@@ -960,7 +987,7 @@ export async function nextQuiz(
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
   const state = await readState();
-  const lang = localeOf(state, input);
+  const lang = localeOf(input);
   const now = Date.now();
 
   const usage = project.technologies.find((item) => item.techId === input.techId);
@@ -1059,7 +1086,7 @@ export async function answerQuiz(
   const t = await tFor(input);
   const project = await ensureProject(input, context, t);
   const state = await readState();
-  const lang = localeOf(state, input);
+  const lang = localeOf(input);
 
   const question = state.questions.find((item) => item.id === input.questionId);
   if (!question) throw new Error(t.err_unknown_question);
@@ -1146,7 +1173,7 @@ export async function listReviews(
   const state = await readState();
   const now = Date.now();
   return {
-    reviews: publicReviews(state, project, localeOf(state, input), graspedSet(state, now), now, false),
+    reviews: publicReviews(state, project, localeOf(input), graspedSet(state, now), now, false),
   };
 }
 
@@ -1210,7 +1237,7 @@ export async function markReviewDone(
   });
   const state = await readState();
   return {
-    reviews: publicReviews(state, project, localeOf(state, input), graspedSet(state, now), now, false),
+    reviews: publicReviews(state, project, localeOf(input), graspedSet(state, now), now, false),
     paid,
   };
 }
@@ -1259,7 +1286,7 @@ export async function getAgentImpact(
   }
 
   const now = Date.now();
-  const lang = localeOf(state, input);
+  const lang = localeOf(input);
   const refreshedGrasp = graspedSet(state, now);
   const files = new Set(mutations.map((item) => item.file));
   const techName = new Map(state.techs.map((item) => [item.id, item.name]));
@@ -1300,7 +1327,7 @@ export async function getAgentImpact(
 
 export async function overview(input: ZodOutput<typeof overviewRpc.input>) {
   const state = await readState();
-  const lang = localeOf(state, input);
+  const lang = localeOf(input);
   const now = Date.now();
   const grasped = graspedSet(state, now);
   const techName = new Map(state.techs.map((item) => [item.id, item.name]));
@@ -1328,11 +1355,10 @@ async function settingsView(
 ): Promise<Settings> {
   const providers = await listGenerationProviders(context.paseo).catch(() => []);
   return {
-    locale: state.settings.locale,
-    resolvedLocale: localeOf(state, input),
-    lockedByEnv: LOCALES.some(
-      (locale) => (process.env.RUMEN_LANG ?? "").toLowerCase().startsWith(locale),
-    ),
+    // ⭐ 语言来自三个插件共用的那个文件，不是本插件的私有状态
+    locale: sharedLocalePreference(),
+    resolvedLocale: localeOf(input),
+    lockedByEnv: lockedByEnv(process.env, "RUMEN_LANG"),
     provider: state.settings.provider,
     availableProviders: providers,
     deferToUserAgents: state.settings.deferToUserAgents,
@@ -1343,6 +1369,7 @@ export async function getSettings(
   input: ZodOutput<typeof settingsRpc.input>,
   context: PluginHandlerContext,
 ): Promise<Settings> {
+  await refreshSharedLocale();
   return settingsView(await readState(), input, context);
 }
 
@@ -1350,8 +1377,11 @@ export async function updateSettings(
   input: ZodOutput<typeof updateSettingsRpc.input>,
   context: PluginHandlerContext,
 ): Promise<Settings> {
+  // 语言写共享文件；另外两个插件下次渲染就跟上
+  if (input.locale !== undefined && !lockedByEnv(process.env, "RUMEN_LANG")) {
+    await setSharedLocale(input.locale);
+  }
   const state = await updateState((current) => {
-    if (input.locale !== undefined) current.settings.locale = input.locale;
     if (input.provider !== undefined) current.settings.provider = input.provider;
     if (input.deferToUserAgents !== undefined) current.settings.deferToUserAgents = input.deferToUserAgents;
     return structuredClone(current);

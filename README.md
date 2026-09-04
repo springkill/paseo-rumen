@@ -133,8 +133,12 @@ agent 改文件 → 记一笔知识债，掌握度不动
 判定优先级（服务端唯一裁决）：
 
 ```
-RUMEN_LANG > 设置页上的选择 > 客户端语言 > 宿主机 LC_ALL/LC_MESSAGES/LANG > en
+RUMEN_LANG > PASEO_PLUGIN_LANG > 共享设置 > 客户端语言 > 宿主机 LC_ALL/LC_MESSAGES/LANG > en
 ```
+
+⭐ **「共享设置」是三个 Paseo 插件共用的**（`$PASEO_HOME/plugin-locale.json`）——
+在 rumen 里改语言，pi-todos 和 provider-balances 下次渲染也跟着变。
+装了三个插件不该设三次。
 
 用户的显式选择压过环境推断 —— `LANG` 是环境在*告诉*我们这台机器习惯什么语言，
 那是推断；设置页上点出来的是*决定*。客户端语言排在宿主机之前，
