@@ -4,8 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ingestMutations, markReviewed, mutationFrom, verdictBucket } from "./observe.server";
-import { ScanBoundaryError, scanWorkspace } from "./scanner.server";
+import { ingestMutations, markReviewed, mutationFrom, verdictBucket } from "../server/observe.server";
+import { ScanBoundaryError, scanWorkspace } from "../server/scanner.server";
 import {
   exportKnowledge,
   resetCommitCacheForTests,
@@ -18,8 +18,8 @@ import {
   overview,
   recordEvidence,
   updateSettings,
-} from "./service.server";
-import { readState, resetStoreForTests, statePath, updateState } from "./store.server";
+} from "../server/service.server";
+import { readState, resetStoreForTests, statePath, updateState } from "../server/store.server";
 
 const AGENT_ENTRIES = [
   {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { collapse, FLAT_ORDER, flatRank, identityColor, IDENTITY_COLORS } from "./buckets.shared";
+import { collapse, FLAT_ORDER, flatRank, identityColor, IDENTITY_COLORS } from "../domain/buckets.shared";
 import {
   attributeFromCommit,
   ATTRIBUTION_FLOOR,
@@ -14,10 +14,10 @@ import {
   normalizeRemote,
   projectIdentity,
   refineAttribution,
-} from "./domain.shared";
-import { LOCALES, localeFromTag, MESSAGE_KEYS, relativeTime, resolveLocale, translator } from "./i18n.shared";
-import { assertNoProjectLeak, PrivacyLeakError, stripPaths } from "./privacy.shared";
-import { resolveTech, TECH_DEFS } from "./techmap.shared";
+} from "../domain/domain.shared";
+import { LOCALES, localeFromTag, MESSAGE_KEYS, relativeTime, resolveLocale, translator } from "../domain/i18n.shared";
+import { assertNoProjectLeak, PrivacyLeakError, stripPaths } from "../domain/privacy.shared";
+import { resolveTech, TECH_DEFS } from "../domain/techmap.shared";
 
 // ── 掌握度 ──────────────────────────────────────────────────────────
 

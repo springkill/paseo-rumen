@@ -10,8 +10,8 @@ import { type PluginAgentPanelProps, useRpc, useWorkspace } from "@getpaseo/plug
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { ActivityIndicator, ScrollView, Text, View } from "react-native";
-import { bucketLabel } from "./buckets.shared";
-import { agentImpactRpc } from "./contracts.shared";
+import { bucketLabel } from "../domain/buckets.shared";
+import { agentImpactRpc } from "../domain/contracts.shared";
 import { ReviewView } from "./review.client";
 import {
   Card,

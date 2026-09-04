@@ -19,7 +19,7 @@ import { execFile } from "node:child_process";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { confidenceForLayers, projectIdentity } from "./domain.shared";
+import { confidenceForLayers, projectIdentity } from "../domain/domain.shared";
 import { forbiddenRoot } from "./roots.server";
 import type { StoredAnchor, StoredProjectTech, StoredTechEntity } from "./store.server";
 import {
@@ -27,7 +27,7 @@ import {
   resolveTech,
   type LearnedAlias,
   type PendingPackage,
-} from "./techmap.shared";
+} from "../domain/techmap.shared";
 
 const exec = promisify(execFile);
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getJob, listJobs, resetJobsForTests, startJob } from "./jobs.server";
+import { getJob, listJobs, resetJobsForTests, startJob } from "../server/jobs.server";
 
 const SEED = { kind: "wiki" as const, projectId: "p1", techId: "tech:redis" };
 

@@ -10,7 +10,7 @@ import { Icon, type PluginWorkspacePanelProps, useRpc, useWorkspace } from "@get
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useMemo } from "react";
 import { ActivityIndicator, ScrollView, Text, View } from "react-native";
-import { dashboardRpc, type RumenTarget } from "./contracts.shared";
+import { dashboardRpc, type RumenTarget } from "../domain/contracts.shared";
 import { Empty, ErrorCard, IdentityDot, useLocale } from "./ui.client";
 import { ProjectBody, ScanButton, type ViewContext } from "./views.client";
 

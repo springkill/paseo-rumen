@@ -15,7 +15,7 @@ import { useToast } from "@getpaseo/plugin/react-native";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, Text, TextInput, View } from "react-native";
-import { bucketLabel } from "./buckets.shared";
+import { bucketLabel } from "../domain/buckets.shared";
 import {
   classifyRpc,
   evidenceRpc,
@@ -34,8 +34,8 @@ import {
   type RumenTarget,
   type Settings,
   type Technology,
-} from "./contracts.shared";
-import { LOCALES, LOCALE_NATIVE_NAME, relativeTime, type Locale, type Translator } from "./i18n.shared";
+} from "../domain/contracts.shared";
+import { LOCALES, LOCALE_NATIVE_NAME, relativeTime, type Locale, type Translator } from "../domain/i18n.shared";
 import { ReviewView } from "./review.client";
 import {
   Button,

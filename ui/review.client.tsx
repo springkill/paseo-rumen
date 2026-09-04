@@ -21,8 +21,8 @@ import {
   reviewSourceRpc,
   type ReviewItem,
   type RumenTarget,
-} from "./contracts.shared";
-import { relativeTime, type Translator } from "./i18n.shared";
+} from "../domain/contracts.shared";
+import { relativeTime, type Translator } from "../domain/i18n.shared";
 import { Button, Card, Empty, MasteryBar, Mono, Pill, Row, Section } from "./ui.client";
 
 function SourceView({ target, clientLocale, reviewId, theme, t }: {

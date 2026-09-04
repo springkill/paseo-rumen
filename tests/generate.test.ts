@@ -6,8 +6,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { extractJson, GenerationBusyError, runStructured } from "./agentrun.server";
-import { analyzeCommits, matchKnowledge, readCommits, repoIdentityEmail } from "./commits.server";
+import { extractJson, GenerationBusyError, runStructured } from "../server/agentrun.server";
+import { analyzeCommits, matchKnowledge, readCommits, repoIdentityEmail } from "../server/commits.server";
 import {
   fallbackNodes,
   generateQuestion,
@@ -19,8 +19,8 @@ import {
   questionId,
   QUIZ_PASS_THRESHOLD,
   wikiCacheKey,
-} from "./generate.server";
-import type { StoredNode, StoredProject, StoredTechEntity } from "./store.server";
+} from "../server/generate.server";
+import type { StoredNode, StoredProject, StoredTechEntity } from "../server/store.server";
 import test from "node:test";
 
 const exec = promisify(execFile);
@@ -649,7 +649,7 @@ test("撞上活动轮次时等它，而不是把重试烧掉", async () => {
 test("⭐ 捡起上次遗留的产物 —— 我们先放弃、agent 后写完的情况", async () => {
   // 实机就是这么卡住的：轮次超时判失败，agent 五分钟后才写完文件。
   // 内容是好的，躺在那儿。再点一次不该重新烧一遍配额
-  const { outputPathFor, runsDirectory } = await import("./agentrun.server");
+  const { outputPathFor, runsDirectory } = await import("../server/agentrun.server");
   const path = outputPathFor("leftover-case");
   await mkdir(runsDirectory(), { recursive: true });
   await writeFile(path, '{"ok":123}', "utf8");
@@ -674,7 +674,7 @@ test("⭐ 捡起上次遗留的产物 —— 我们先放弃、agent 后写完�
 });
 
 test("遗留产物不合格就删掉重来，不会卡在坏文件上", async () => {
-  const { outputPathFor, runsDirectory } = await import("./agentrun.server");
+  const { outputPathFor, runsDirectory } = await import("../server/agentrun.server");
   const path = outputPathFor("leftover-bad");
   await mkdir(runsDirectory(), { recursive: true });
   await writeFile(path, '{"garbage":true}', "utf8");

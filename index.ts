@@ -1,5 +1,5 @@
 import type { PluginContext, PluginTimelineData } from "@getpaseo/plugin";
-import { RumenAgentPanel } from "./agent.client";
+import { RumenAgentPanel } from "./ui/agent.client";
 import {
   agentImpactRpc,
   attachmentSearchRpc,
@@ -23,9 +23,9 @@ import {
   TimelineImpactSchema,
   updateSettingsRpc,
   wikiRpc,
-} from "./contracts.shared";
-import { resolveLocale, translator } from "./i18n.shared";
-import { MainSurface } from "./main.client";
+} from "./domain/contracts.shared";
+import { resolveLocale, translator } from "./domain/i18n.shared";
+import { MainSurface } from "./ui/main.client";
 import {
   answerQuiz,
   classify,
@@ -47,10 +47,10 @@ import {
   searchAttachments,
   setPrivacy,
   updateSettings,
-} from "./service.server";
-import { RumenTimelineCard } from "./timeline.client";
-import { parseTimelineImpact } from "./timeline.shared";
-import { RumenWorkspacePanel } from "./workspace.client";
+} from "./server/service.server";
+import { RumenTimelineCard } from "./ui/timeline.client";
+import { parseTimelineImpact } from "./domain/timeline.shared";
+import { RumenWorkspacePanel } from "./ui/workspace.client";
 
 function timelineData(value: unknown): PluginTimelineData {
   return JSON.parse(JSON.stringify(value)) as PluginTimelineData;

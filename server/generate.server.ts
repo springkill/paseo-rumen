@@ -29,11 +29,11 @@
 
 import type { PaseoApi } from "@getpaseo/client";
 import { runStructured } from "./agentrun.server";
-import type { Privacy } from "./domain.shared";
-import { stableHash } from "./domain.shared";
-import type { Locale } from "./i18n.shared";
+import type { Privacy } from "../domain/domain.shared";
+import { stableHash } from "../domain/domain.shared";
+import type { Locale } from "../domain/i18n.shared";
 import { runsDirectory } from "./agentrun.server";
-import { allowsProjectCode, assertNoProjectLeak } from "./privacy.shared";
+import { allowsProjectCode, assertNoProjectLeak } from "../domain/privacy.shared";
 import type { StoredAnchor, StoredNode, StoredWiki, StoredWikiSection } from "./store.server";
 
 /** 内容 schema 版本。改了内容结构就 +1，旧缓存自动失效。 */

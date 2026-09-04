@@ -8,7 +8,7 @@
 import { Icon, type PluginTimelineItemProps } from "@getpaseo/plugin";
 import React from "react";
 import { Text, View } from "react-native";
-import type { TimelineImpact } from "./contracts.shared";
+import type { TimelineImpact } from "../domain/contracts.shared";
 import { useLocale } from "./ui.client";
 
 export function RumenTimelineCard({ item, theme, host }: PluginTimelineItemProps<TimelineImpact>) {

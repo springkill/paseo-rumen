@@ -5,7 +5,7 @@
   "description": "A local-first software engineering knowledge layer for Paseo",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test *.test.ts",
+    "test": "tsx --test tests/*.test.ts",
     "check": "npm run typecheck && npm test"
   },
   "devDependencies": {

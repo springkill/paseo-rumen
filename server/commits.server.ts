@@ -32,7 +32,7 @@ import {
   refineAttribution,
   type Attribution,
   type ObservationWindow,
-} from "./domain.shared";
+} from "../domain/domain.shared";
 import type {
   StoredEvidence,
   StoredNode,

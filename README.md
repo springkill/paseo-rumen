@@ -177,6 +177,14 @@ Paseo 的插件是**受信任、不沙箱**的。就 Rumen 而言这意味着：
 
 装任何第三方插件都等于信任它的作者。先看代码，或用 `--ref` 钉到你审过的 commit。
 
+## 目录结构
+
+按层分：`domain/`（纯逻辑）、`server/`（插件子进程）、`ui/`（Paseo 应用内）、`tests/`。
+详见 [STRUCTURE.md](STRUCTURE.md)。
+
+⚠️ **文件名后缀 `.client` / `.server` / `.shared` 是承重的** —— Paseo 的编译器靠它切分
+前后端 bundle，目录名不参与判定。改后缀会静默改变模块归属。
+
 ## 开发
 
 ```bash

@@ -13,10 +13,10 @@
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import type { EvidenceKind, Privacy } from "./domain.shared";
-import type { Locale } from "./i18n.shared";
+import type { EvidenceKind, Privacy } from "../domain/domain.shared";
+import type { Locale } from "../domain/i18n.shared";
 import { forbiddenRoot } from "./roots.server";
-import type { LearnedAlias, PendingPackage, TechCategory } from "./techmap.shared";
+import type { LearnedAlias, PendingPackage, TechCategory } from "../domain/techmap.shared";
 
 export interface StoredAnchor {
   file: string;

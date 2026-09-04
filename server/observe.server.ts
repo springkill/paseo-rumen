@@ -19,7 +19,7 @@
 
 import { readFile } from "node:fs/promises";
 import { basename, join, relative, resolve, sep } from "node:path";
-import { evidenceKey, stableHash } from "./domain.shared";
+import { evidenceKey, stableHash } from "../domain/domain.shared";
 import type {
   StoredEvidence,
   StoredNode,
@@ -27,7 +27,7 @@ import type {
   StoredProject,
   StoredReview,
 } from "./store.server";
-import { learnedKey, resolveTech, type LearnedAlias } from "./techmap.shared";
+import { learnedKey, resolveTech, type LearnedAlias } from "../domain/techmap.shared";
 
 /** 一次被观测到的文件改动。 */
 export interface Mutation {

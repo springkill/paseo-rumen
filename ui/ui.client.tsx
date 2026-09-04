@@ -23,9 +23,9 @@ import { Icon, type PluginTheme, useRpc } from "@getpaseo/plugin";
 import { useQuery } from "@tanstack/react-query";
 import React from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
-import { settingsRpc, type Settings } from "./contracts.shared";
-import { bucketStyle, masteryColor, type StatusBucket } from "./buckets.shared";
-import { translator, type Locale, type Translator } from "./i18n.shared";
+import { settingsRpc, type Settings } from "../domain/contracts.shared";
+import { bucketStyle, masteryColor, type StatusBucket } from "../domain/buckets.shared";
+import { translator, type Locale, type Translator } from "../domain/i18n.shared";
 
 // ── 语言 ────────────────────────────────────────────────────────────
 

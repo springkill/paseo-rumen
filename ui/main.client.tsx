@@ -12,8 +12,8 @@ import { Icon, type PluginSurfaceProps, useRpc } from "@getpaseo/plugin";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useState } from "react";
 import { ActivityIndicator, ScrollView, Text, View } from "react-native";
-import { dashboardRpc, overviewRpc, type ProjectSummary, type RumenTarget } from "./contracts.shared";
-import { relativeTime } from "./i18n.shared";
+import { dashboardRpc, overviewRpc, type ProjectSummary, type RumenTarget } from "../domain/contracts.shared";
+import { relativeTime } from "../domain/i18n.shared";
 import {
   Button,
   Card,

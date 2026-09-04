@@ -20,8 +20,8 @@
 
 import type { PaseoApi } from "@getpaseo/client";
 import { runStructured } from "./agentrun.server";
-import type { LearnedAlias, PendingPackage, TechCategory } from "./techmap.shared";
-import { isTechCategory, TECH_CATEGORIES } from "./techmap.shared";
+import type { LearnedAlias, PendingPackage, TechCategory } from "../domain/techmap.shared";
+import { isTechCategory, TECH_CATEGORIES } from "../domain/techmap.shared";
 
 /** 一批多少个。太大模型容易漏项、输出被截断；太小失去批量的意义。 */
 export const BATCH_SIZE = 40;

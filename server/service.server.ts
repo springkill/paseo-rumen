@@ -12,7 +12,7 @@ import {
   NoProviderError,
   resolveProvider,
 } from "./agentrun.server";
-import { collapse, identityColor, type StatusBucket } from "./buckets.shared";
+import { collapse, identityColor, type StatusBucket } from "../domain/buckets.shared";
 import { getJob, listJobs, startJob } from "./jobs.server";
 import { analyzeCommits, headSha, type CommitInsight } from "./commits.server";
 import { classifyPending } from "./classify.server";
@@ -37,7 +37,7 @@ import type {
   settingsRpc,
   updateSettingsRpc,
   wikiRpc,
-} from "./contracts.shared";
+} from "../domain/contracts.shared";
 import type {
   AgentImpact,
   Dashboard,
@@ -48,7 +48,7 @@ import type {
   Settings,
   Technology,
   Wiki,
-} from "./contracts.shared";
+} from "../domain/contracts.shared";
 import {
   evidenceKey,
   identityStrength,
@@ -56,7 +56,7 @@ import {
   stableHash,
   type EvidenceKind,
   type Mastery,
-} from "./domain.shared";
+} from "../domain/domain.shared";
 import {
   fallbackNodes,
   generateQuestion,
@@ -74,9 +74,9 @@ import {
   translator,
   type Locale,
   type Translator,
-} from "./i18n.shared";
+} from "../domain/i18n.shared";
 import { fastPath, ingestMutations, markReviewed, mutationFrom, verdictBucket, type Mutation } from "./observe.server";
-import { allowsGeneration, allowsProjectCode } from "./privacy.shared";
+import { allowsGeneration, allowsProjectCode } from "../domain/privacy.shared";
 import { identifyProject, resolveProjectRoot, ScanBoundaryError, scanWorkspace } from "./scanner.server";
 import {
   dataDirectory,
@@ -87,7 +87,7 @@ import {
   type StoredProject,
   type StoredQuestion,
 } from "./store.server";
-import { learnedKey } from "./techmap.shared";
+import { learnedKey } from "../domain/techmap.shared";
 
 type LocaleInput = { clientLocale?: string };
 type WorkspaceInput = LocaleInput & {
