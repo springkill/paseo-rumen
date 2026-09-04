@@ -157,7 +157,7 @@ paseo plugin install https://github.com/springkill/paseo-rumen
 钉版本、追更新：
 
 ```bash
-paseo plugin install https://github.com/springkill/paseo-rumen --ref v0.2.0
+paseo plugin install https://github.com/springkill/paseo-rumen --ref v0.3.0
 paseo plugin status              # 有没有新版
 paseo plugin update paseo-rumen
 ```
