@@ -1,7 +1,7 @@
 {
   "name": "paseo-rumen",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "A local-first software engineering knowledge layer for Paseo",
   "scripts": {
     "typecheck": "tsc --noEmit",
