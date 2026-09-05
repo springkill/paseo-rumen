@@ -21,7 +21,13 @@
 
 import { Icon, type PluginTheme, useRpc } from "@getpaseo/plugin";
 import { useQuery } from "@tanstack/react-query";
-import React from "react";
+// ⚠️ 具名导入 `useMemo`，**不要** `React.useMemo`。
+// esbuild 会把它编成 `import_react.default.useMemo` —— 依赖 `__toESM` interop
+// 合成出来的 `.default`。宿主在 web 与原生（Hermes）两端各自提供 react 模块，
+// 两边 interop 形状不保证一样：安卓上这条整片界面变成
+// `Plugin failed: Object is not a function`，web 端完全正常。
+// `React` 本体仍需保留给 `React.ReactNode` 这类**类型**位置（编译后会被擦掉）。
+import React, { useMemo } from "react";
 import { ActivityIndicator, NativeModules, Pressable, Text, View } from "react-native";
 import { settingsRpc, type Settings } from "../domain/contracts.shared";
 import { bucketStyle, masteryColor, type StatusBucket } from "../domain/buckets.shared";
@@ -76,7 +82,7 @@ export function detectClientLocale(): string | undefined {
 
   // ③ 兜底
   try {
-    return new Intl.DateTimeFormat().resolvedOptions().locale;
+    return new Intl.DateTimeFormat().resolvedOptions().locale; // hermes-ok: 整段在 try/catch 里，Hermes 没有 Intl 时抛出后返回 undefined，调用方继续往下找
   } catch {
     return undefined;
   }
@@ -97,7 +103,7 @@ export interface LocaleContext {
  * 比首帧空白好。
  */
 export function useLocale(hostId: string): LocaleContext {
-  const clientLocale = React.useMemo(() => detectClientLocale(), []);
+  const clientLocale = useMemo(() => detectClientLocale(), []);
   const getSettings = useRpc(settingsRpc);
   const query = useQuery({
     queryKey: ["rumen", "settings", hostId],
